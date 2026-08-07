@@ -238,8 +238,8 @@ if (( START_PHASE <= 4 && END_PHASE >= 4 )); then
     "root"
 fi
 
-# ── Phase 5: Cleanup — Optional ───────────────────────────────────────────────
-if (( END_PHASE >= 5 )); then
+# ── Phase 5: Cleanup — must be explicitly requested via --cleanup or --phase 5 ─
+if (( START_PHASE <= 5 && END_PHASE >= 5 )); then
   log ""
   log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
   log "PHASE 5: Old home cleanup. This is IRREVERSIBLE."
