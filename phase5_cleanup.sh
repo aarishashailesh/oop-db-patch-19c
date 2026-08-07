@@ -8,7 +8,7 @@
 set -euo pipefail
 
 # Inherit group-write for shared NFS staging area
-umask 0002
+umask 0022
 
 CONF_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patch.conf"
 source "${CONF_FILE}"

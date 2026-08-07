@@ -4,7 +4,7 @@
 # Run as: root
 # =============================================================================
 set -euo pipefail
-umask 0002
+umask 0022
 
 CONF_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patch.conf"
 source "${CONF_FILE}"

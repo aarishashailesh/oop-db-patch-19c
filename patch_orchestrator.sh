@@ -4,27 +4,31 @@
 # Run as: root
 #
 # USAGE:
-#   ./patch_orchestrator.sh [--phase <1-5>] [--from-phase <n>] [--dry-run]
+#   ./patch_orchestrator.sh [--phase <1-7>] [--from-phase <n>] [--dry-run]
 #
 # OPTIONS:
-#   --phase <n>      Run only phase n (1-5)
+#   --phase <n>      Run only phase n (1-7)
 #   --from-phase <n> Run from phase n to end
 #   --dry-run        Print what would be done without executing
 #   --cleanup        Also run phase 5 cleanup (off by default — run manually)
+#   --full           Run all phases 1-7 including cleanup, security, AIDE
 #
 # PHASES:
-#   1  phase1_grid_prep.sh   Build and patch new Grid home  (online)
-#   2  phase2_db_prep.sh     Build and patch new DB home    (online)
-#   3  phase3_switch.sh      Home switch + datapatch        (OUTAGE)
-#   4  phase4_post_install.sh Post-patch validation          (online)
-#   5  phase5_cleanup.sh     Deinstall old homes            (manual)
+#   1  phase1_grid_prep.sh    Build and patch new Grid home      (online)
+#   2  phase2_db_prep.sh      Build and patch new DB home        (online)
+#   3  phase3_switch.sh       Home switch + AutoUpgrade deploy   (OUTAGE)
+#   4  phase4_post_install.sh Post-patch validation + utlrp      (online)
+#   5  phase5_cleanup.sh      Deinstall old homes                (manual)
+#   6  phase6_security.sh     FIPS 140 + extproc disable         (manual)
+#   7  phase7_aide.sh         AIDE integrity DB reset            (manual)
 # =============================================================================
 set -euo pipefail
 
-# Set umask so all directories/files created by root, grid, and oracle
-# inherit group-write permission — required for shared NFS staging area
-# where both grid and oracle users need to read/write patch directories.
-umask 0002
+# Set umask 0022 — matches UMASK 022 in /etc/login.defs on Oracle Linux.
+# Explicitly set here for scripts invoked via nohup/sudo which may not
+# inherit the login session umask. Oracle home files require 755/644.
+# Log files are the ONLY exception — explicitly chmod 664 after creation.
+umask 0022
 
 # ── Must run as root ──────────────────────────────────────────────────────────
 if [[ "${EUID}" -ne 0 ]]; then
@@ -34,7 +38,7 @@ fi
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 START_PHASE=1
-END_PHASE=4    # Phase 5 (cleanup) is opt-in only
+END_PHASE=4    # Phase 5 (cleanup) and beyond are opt-in only
 DRY_RUN=false
 SINGLE_PHASE=""
 
@@ -45,6 +49,7 @@ while [[ $# -gt 0 ]]; do
     --from-phase)  START_PHASE="$2"; shift 2 ;;
     --dry-run)     DRY_RUN=true; shift ;;
     --cleanup)     END_PHASE=5; shift ;;
+    --full)        END_PHASE=7; shift ;;
     --help|-h)
       sed -n '3,25p' "$0"
       exit 0
@@ -147,12 +152,19 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   mkdir -p "${LOG_DIR}"
   chown root:"${INSTALL_GROUP}" "${LOG_DIR}"
   chmod 775 "${LOG_DIR}"
+  # Pre-create log files with explicit chmod 664 so grid/oracle can append.
+  # chmod 664 sets permissions directly — no umask change needed.
+  mkdir -p "${LOG_DIR}"
+  chown root:"${INSTALL_GROUP}" "${LOG_DIR}"
+  chmod 775 "${LOG_DIR}"
   for _logfile in \
     phase1_grid_prep.log \
     phase2_db_prep.log \
     phase3_switch.log \
     phase4_post_install.log \
     phase5_cleanup.log \
+    phase6_security.log \
+    phase7_aide.log \
     master_patch.log; do
     _logpath="${LOG_DIR}/${_logfile}"
     touch "${_logpath}"
@@ -160,7 +172,12 @@ if [[ "${DRY_RUN}" != "true" ]]; then
     chmod 664 "${_logpath}"
   done
   unset _logfile _logpath
-  log "Log directory: ${LOG_DIR}"
+  log "Log directory: ${LOG_DIR} (log files: 664, umask: 0022)"
+  # Ensure PATCH_LOC staging directory is group-writable so oracle/grid
+  # can extract patches into it. This is a shared NFS staging area, not
+  # an Oracle home — group write here is correct and required.
+  chmod g+w "${PATCH_LOC}"
+  log "Patch staging: ${PATCH_LOC} (group-write enabled for oracle/grid)"
 fi
 
 # ── Phase 1: Online — Build new Grid home ─────────────────────────────────────
@@ -221,7 +238,7 @@ if (( START_PHASE <= 4 && END_PHASE >= 4 )); then
     "root"
 fi
 
-# ── Phase 5: Cleanup — Optional, must be explicitly requested ─────────────────
+# ── Phase 5: Cleanup — Optional ───────────────────────────────────────────────
 if (( END_PHASE >= 5 )); then
   log ""
   log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
@@ -230,6 +247,20 @@ if (( END_PHASE >= 5 )); then
   log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
   run_phase 5 "phase5_cleanup.sh" \
     "Deinstall old homes ${OLD_GRID_HOME} and ${OLD_DB_HOME}" \
+    "root"
+fi
+
+# ── Phase 6: Security hardening — Optional ────────────────────────────────────
+if (( START_PHASE <= 6 && END_PHASE >= 6 )); then
+  run_phase 6 "phase6_security.sh" \
+    "FIPS 140 configuration + extproc disable" \
+    "root"
+fi
+
+# ── Phase 7: AIDE reset — Optional ───────────────────────────────────────────
+if (( START_PHASE <= 7 && END_PHASE >= 7 )); then
+  run_phase 7 "phase7_aide.sh" \
+    "AIDE integrity database reset" \
     "root"
 fi
 
