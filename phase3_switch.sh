@@ -43,7 +43,14 @@ log "gridSetup.sh -switchGridHome complete."
 # ── Step 2: root.sh from new Grid home (as root) ─────────────────────────────
 log "Step 2: Running root.sh from new Grid home..."
 "${NEW_GRID_HOME}/root.sh"
-log "root.sh complete."
+log "Grid home root.sh complete."
+
+# ── Step 2b: root.sh from new DB home (as root) ───────────────────────────────
+# Required after runInstaller INSTALL_DB_SWONLY in Phase 2.
+# Must run AFTER Grid home root.sh so the new Grid stack is active.
+log "Step 2b: Running root.sh from new DB home..."
+"${NEW_DB_HOME}/root.sh"
+log "DB home root.sh complete."
 
 # ── Step 3: Verify Grid ───────────────────────────────────────────────────────
 log "Step 3: Verifying Grid resources (waiting 30s for stack to stabilise)..."
