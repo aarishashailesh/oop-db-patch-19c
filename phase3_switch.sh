@@ -75,6 +75,22 @@ for profile in "${GRID_HOME_DIR}/.bash_profile" "${GRID_HOME_DIR}/.bashrc"; do
   fi
 done
 
+# ── Step 4b: Update root user profiles ───────────────────────────────────────
+# root may have ORACLE_HOME pointing to the Grid home for crsctl/srvctl access.
+# Update the same way as grid user profiles.
+log "Step 4b: Updating root user profiles..."
+ROOT_HOME_DIR=$(eval echo ~root)
+for profile in "${ROOT_HOME_DIR}/.bash_profile" "${ROOT_HOME_DIR}/.bashrc"; do
+  if [[ -f "${profile}" ]]; then
+    if grep -q "${OLD_GRID_HOME}" "${profile}"; then
+      sed -i "s|${OLD_GRID_HOME}|${NEW_GRID_HOME}|g" "${profile}"
+      log "  Updated: ${profile}"
+    else
+      log "  Skipped: ${profile} (no reference to ${OLD_GRID_HOME})"
+    fi
+  fi
+done
+
 # ── Step 5: AutoUpgrade deploy (as oracle) ────────────────────────────────────
 log "Step 5: AutoUpgrade deploy — DB home switch + datapatch..."
 log "  Config   : ${AUTOUPGRADE_CFG}"
@@ -109,8 +125,12 @@ log "Step 6: Updating oracle user profiles..."
 ORACLE_HOME_DIR=$(eval echo ~${ORACLE_USER})
 for profile in "${ORACLE_HOME_DIR}/.bash_profile" "${ORACLE_HOME_DIR}/.bashrc"; do
   if [[ -f "${profile}" ]]; then
-    sed -i "s|${OLD_DB_HOME}|${NEW_DB_HOME}|g" "${profile}"
-    log "  Updated: ${profile}"
+    if grep -q "${OLD_DB_HOME}" "${profile}"; then
+      sed -i "s|${OLD_DB_HOME}|${NEW_DB_HOME}|g" "${profile}"
+      log "  Updated: ${profile}"
+    else
+      log "  Skipped: ${profile} (no reference to ${OLD_DB_HOME})"
+    fi
   fi
 done
 
