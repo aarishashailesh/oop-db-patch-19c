@@ -27,6 +27,78 @@ log "New DB Home  : ${NEW_DB_HOME}"
 NODE_NAME=$(/usr/bin/hostname -s)
 log "Node: ${NODE_NAME}"
 
+# ── Helper: disable/enable DB_DDL_ALERT_TRG in CDB and all open PDBs ─────────
+manage_ddl_trigger() {
+  local action="$1"   # DISABLE or ENABLE
+  local sql_action
+  [[ "${action}" == "DISABLE" ]] && sql_action="DISABLE" || sql_action="ENABLE"
+
+  log "  Trigger action: ALTER TRIGGER SYS.DB_DDL_ALERT_TRG ${sql_action}"
+
+  cat > /tmp/phase3_trigger_${action,,}.sql << SQLEOF
+SET PAGESIZE 100 LINESIZE 120 FEEDBACK ON
+
+-- Act on CDB\$ROOT
+ALTER SESSION SET CONTAINER = CDB\$ROOT;
+DECLARE
+  v_count NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO v_count FROM dba_triggers
+  WHERE trigger_name = 'DB_DDL_ALERT_TRG' AND owner = 'SYS';
+  IF v_count > 0 THEN
+    EXECUTE IMMEDIATE 'ALTER TRIGGER SYS.DB_DDL_ALERT_TRG ${sql_action}';
+    DBMS_OUTPUT.PUT_LINE('CDB\$ROOT: DB_DDL_ALERT_TRG ${sql_action}D');
+  ELSE
+    DBMS_OUTPUT.PUT_LINE('CDB\$ROOT: DB_DDL_ALERT_TRG not found - skipped');
+  END IF;
+END;
+/
+
+-- Act on all open PDBs
+DECLARE
+  CURSOR c_pdbs IS
+    SELECT name FROM v\$pdbs
+    WHERE  open_mode = 'READ WRITE'
+    AND    name != 'PDB\$SEED';
+  v_count NUMBER;
+BEGIN
+  FOR pdb IN c_pdbs LOOP
+    EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = ' || pdb.name;
+    SELECT COUNT(*) INTO v_count FROM dba_triggers
+    WHERE trigger_name = 'DB_DDL_ALERT_TRG' AND owner = 'SYS';
+    IF v_count > 0 THEN
+      EXECUTE IMMEDIATE 'ALTER TRIGGER SYS.DB_DDL_ALERT_TRG ${sql_action}';
+      DBMS_OUTPUT.PUT_LINE(pdb.name || ': DB_DDL_ALERT_TRG ${sql_action}D');
+    ELSE
+      DBMS_OUTPUT.PUT_LINE(pdb.name || ': DB_DDL_ALERT_TRG not found - skipped');
+    END IF;
+  END LOOP;
+END;
+/
+
+-- Verify final status across all containers
+SELECT con_id, owner, trigger_name, status
+FROM   cdb_triggers
+WHERE  trigger_name = 'DB_DDL_ALERT_TRG'
+ORDER  BY con_id;
+
+EXIT;
+SQLEOF
+
+  su - "${ORACLE_USER}" -c "
+    export ORACLE_HOME=${OLD_DB_HOME}
+    export ORACLE_SID=${DB_NAME}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @/tmp/phase3_trigger_${action,,}.sql
+  "
+  rm -f /tmp/phase3_trigger_${action,,}.sql
+  log "  Trigger ${sql_action} complete."
+}
+
+# ── Step 0: Disable DB_DDL_ALERT_TRG before outage ───────────────────────────
+log "Step 0: Disabling DB_DDL_ALERT_TRG in CDB and all open PDBs..."
+manage_ddl_trigger "DISABLE"
+
 # ── Step 1: gridSetup.sh -switchGridHome (as grid) ───────────────────────────
 log "Step 1: gridSetup.sh -switchGridHome (as ${GRID_USER})..."
 rungrid "
@@ -119,6 +191,68 @@ runoracle "
     -noconsole
 "
 log "AutoUpgrade deploy complete."
+
+# ── Step 5b: Re-enable DB_DDL_ALERT_TRG after outage ─────────────────────────
+log "Step 5b: Re-enabling DB_DDL_ALERT_TRG in CDB and all open PDBs..."
+# Use new DB home now that AutoUpgrade has switched the database
+cat > /tmp/phase3_trigger_enable.sql << 'SQLEOF'
+SET PAGESIZE 100 LINESIZE 120 FEEDBACK ON SERVEROUTPUT ON
+
+-- Re-enable in CDB$ROOT
+ALTER SESSION SET CONTAINER = CDB$ROOT;
+DECLARE
+  v_count NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO v_count FROM dba_triggers
+  WHERE trigger_name = 'DB_DDL_ALERT_TRG' AND owner = 'SYS';
+  IF v_count > 0 THEN
+    EXECUTE IMMEDIATE 'ALTER TRIGGER SYS.DB_DDL_ALERT_TRG ENABLE';
+    DBMS_OUTPUT.PUT_LINE('CDB$ROOT: DB_DDL_ALERT_TRG ENABLED');
+  ELSE
+    DBMS_OUTPUT.PUT_LINE('CDB$ROOT: DB_DDL_ALERT_TRG not found - skipped');
+  END IF;
+END;
+/
+
+-- Re-enable in all open PDBs
+DECLARE
+  CURSOR c_pdbs IS
+    SELECT name FROM v$pdbs
+    WHERE  open_mode = 'READ WRITE'
+    AND    name != 'PDB$SEED';
+  v_count NUMBER;
+BEGIN
+  FOR pdb IN c_pdbs LOOP
+    EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = ' || pdb.name;
+    SELECT COUNT(*) INTO v_count FROM dba_triggers
+    WHERE trigger_name = 'DB_DDL_ALERT_TRG' AND owner = 'SYS';
+    IF v_count > 0 THEN
+      EXECUTE IMMEDIATE 'ALTER TRIGGER SYS.DB_DDL_ALERT_TRG ENABLE';
+      DBMS_OUTPUT.PUT_LINE(pdb.name || ': DB_DDL_ALERT_TRG ENABLED');
+    ELSE
+      DBMS_OUTPUT.PUT_LINE(pdb.name || ': DB_DDL_ALERT_TRG not found - skipped');
+    END IF;
+  END LOOP;
+END;
+/
+
+-- Verify final status
+SELECT con_id, owner, trigger_name, status
+FROM   cdb_triggers
+WHERE  trigger_name = 'DB_DDL_ALERT_TRG'
+ORDER  BY con_id;
+
+EXIT;
+SQLEOF
+
+su - "${ORACLE_USER}" -c "
+  export ORACLE_HOME=${NEW_DB_HOME}
+  export ORACLE_SID=${DB_NAME}
+  export PATH=\${ORACLE_HOME}/bin:\${PATH}
+  \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @/tmp/phase3_trigger_enable.sql
+"
+rm -f /tmp/phase3_trigger_enable.sql
+log "DB_DDL_ALERT_TRG re-enabled."
 
 # ── Step 6: Update oracle user profiles ───────────────────────────────────────
 log "Step 6: Updating oracle user profiles..."
