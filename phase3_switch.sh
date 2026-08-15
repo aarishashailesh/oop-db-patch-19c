@@ -95,9 +95,105 @@ SQLEOF
   log "  Trigger ${sql_action} complete."
 }
 
+# ── Helper: check database connectivity via SQL and tnsping ───────────────────
+check_connectivity() {
+  local label="$1"        # PRE-PATCH or POST-PATCH
+  local oracle_home="$2"
+  local db_sid="$3"
+
+  log "  ── ${label} Connectivity Check ──"
+
+  # Write single SQL script covering all connection checks from inside the DB
+  cat > /tmp/phase3_conn_check.sql << 'SQLEOF'
+SET PAGESIZE 100 LINESIZE 150 FEEDBACK OFF HEADING ON
+PROMPT
+PROMPT === Instance and Version ===
+SELECT instance_name, version, status,
+       to_char(startup_time,'YYYY-MM-DD HH24:MI:SS') startup_time
+FROM   v$instance;
+
+PROMPT
+PROMPT === Database Role and Mode ===
+SELECT name, db_unique_name, open_mode, database_role, cdb
+FROM   v$database;
+
+PROMPT
+PROMPT === PDB Status ===
+SELECT con_id, name, open_mode, restricted
+FROM   v$pdbs
+ORDER  BY con_id;
+
+PROMPT
+PROMPT === Registered Listeners and Services (V$LISTENER_NETWORK) ===
+SELECT listener_name, host, port, service_name, con_id
+FROM   v$listener_network
+ORDER  BY con_id, listener_name;
+
+PROMPT
+PROMPT === Active Services per Container (CDB_SERVICES) ===
+SELECT con_id, name, network_name, pdb
+FROM   cdb_services
+WHERE  name NOT LIKE 'SYS$%'
+ORDER  BY con_id, name;
+
+PROMPT
+PROMPT === Active User Sessions ===
+SELECT con_id, status, COUNT(*) sessions
+FROM   v$session
+WHERE  type = 'USER'
+GROUP  BY con_id, status
+ORDER  BY con_id, status;
+
+EXIT;
+SQLEOF
+
+  # Run SQL connectivity report
+  log "    SQL connectivity report (local SYSDBA)..."
+  su - "${ORACLE_USER}" -c "
+    export ORACLE_HOME=${oracle_home}
+    export ORACLE_SID=${db_sid}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @/tmp/phase3_conn_check.sql
+  " && log "    SQL check: OK" || log "    SQL check: FAILED"
+
+  # tnsping checks — listener reachability without a full DB connection
+  log "    tnsping checks..."
+  su - "${ORACLE_USER}" -c "
+    export ORACLE_HOME=${oracle_home}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    echo 'tnsping ${DB_NAME}:'
+    \${ORACLE_HOME}/bin/tnsping ${DB_NAME} 1 2>&1 || true
+  " || true
+
+  # tnsping SCAN
+  local scan_name
+  scan_name=$(su - "${GRID_USER}" -c "
+    export ORACLE_HOME=${NEW_GRID_HOME}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    \${ORACLE_HOME}/bin/srvctl config scan 2>/dev/null \
+      | awk '/SCAN name/{print \$3}' | tr -d ','
+  " 2>/dev/null || echo "")
+
+  if [[ -n "${scan_name}" ]]; then
+    su - "${ORACLE_USER}" -c "
+      export ORACLE_HOME=${oracle_home}
+      export PATH=\${ORACLE_HOME}/bin:\${PATH}
+      echo 'tnsping ${scan_name}:'
+      \${ORACLE_HOME}/bin/tnsping ${scan_name} 1 2>&1 || true
+    " || true
+  fi
+
+  rm -f /tmp/phase3_conn_check.sql
+  log "  ── ${label} Connectivity Check Complete ──"
+}
+
 # ── Step 0: Disable DB_DDL_ALERT_TRG before outage ───────────────────────────
 log "Step 0: Disabling DB_DDL_ALERT_TRG in CDB and all open PDBs..."
 manage_ddl_trigger "DISABLE"
+
+# ── Step 0b: Pre-patch connectivity check ─────────────────────────────────────
+log "Step 0b: Pre-patch connectivity check (baseline before outage)..."
+check_connectivity "PRE-PATCH" "${OLD_DB_HOME}" "${DB_NAME}"
 
 # ── Step 1: gridSetup.sh -switchGridHome (as grid) ───────────────────────────
 log "Step 1: gridSetup.sh -switchGridHome (as ${GRID_USER})..."
@@ -253,6 +349,10 @@ su - "${ORACLE_USER}" -c "
 "
 rm -f /tmp/phase3_trigger_enable.sql
 log "DB_DDL_ALERT_TRG re-enabled."
+
+# ── Step 5c: Post-patch connectivity check ────────────────────────────────────
+log "Step 5c: Post-patch connectivity check (confirm all connections healthy)..."
+check_connectivity "POST-PATCH" "${NEW_DB_HOME}" "${DB_NAME}"
 
 # ── Step 6: Update oracle user profiles ───────────────────────────────────────
 log "Step 6: Updating oracle user profiles..."

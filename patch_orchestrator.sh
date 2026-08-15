@@ -148,15 +148,26 @@ fi
 # All phase scripts run as root/grid/oracle and must be able to append to log files.
 # Pre-creating them with root:oinstall 664 ensures all users can write.
 if [[ "${DRY_RUN}" != "true" ]]; then
-  log "Pre-creating log directory and log files..."
+  log "Setting up staging and log directories..."
+
+  # Fix PATCH_LOC permissions — grid and oracle must be able to create subdirectories
+  # when unzipping the RU combo. PATCH_LOC must be owned by grid:oinstall with 775.
+  if [[ -d "${PATCH_LOC}" ]]; then
+    chown "${GRID_USER}:${INSTALL_GROUP}" "${PATCH_LOC}"
+    chmod 775 "${PATCH_LOC}"
+    log "  PATCH_LOC   : ${PATCH_LOC} → 775 ${GRID_USER}:${INSTALL_GROUP}"
+  else
+    die "PATCH_LOC does not exist: ${PATCH_LOC}"
+  fi
+
+  # Create log directory with group-write so root/grid/oracle can all append
   mkdir -p "${LOG_DIR}"
   chown root:"${INSTALL_GROUP}" "${LOG_DIR}"
   chmod 775 "${LOG_DIR}"
-  # Pre-create log files with explicit chmod 664 so grid/oracle can append.
-  # chmod 664 sets permissions directly — no umask change needed.
-  mkdir -p "${LOG_DIR}"
-  chown root:"${INSTALL_GROUP}" "${LOG_DIR}"
-  chmod 775 "${LOG_DIR}"
+  log "  LOG_DIR     : ${LOG_DIR} → 775 root:${INSTALL_GROUP}"
+
+  # Pre-create log files with explicit 664 so all users can append.
+  # chmod 664 sets permissions directly regardless of umask.
   for _logfile in \
     phase1_grid_prep.log \
     phase2_db_prep.log \
@@ -172,12 +183,7 @@ if [[ "${DRY_RUN}" != "true" ]]; then
     chmod 664 "${_logpath}"
   done
   unset _logfile _logpath
-  log "Log directory: ${LOG_DIR} (log files: 664, umask: 0022)"
-  # Ensure PATCH_LOC staging directory is group-writable so oracle/grid
-  # can extract patches into it. This is a shared NFS staging area, not
-  # an Oracle home — group write here is correct and required.
-  chmod g+w "${PATCH_LOC}"
-  log "Patch staging: ${PATCH_LOC} (group-write enabled for oracle/grid)"
+  log "  Log files   : 664 root:${INSTALL_GROUP} (pre-created)"
 fi
 
 # ── Phase 1: Online — Build new Grid home ─────────────────────────────────────
@@ -188,17 +194,6 @@ if (( START_PHASE <= 1 && END_PHASE >= 1 )); then
     mkdir -p "${NEW_GRID_HOME}"
     chown -R "${GRID_USER}:${INSTALL_GROUP}" "$(dirname "${NEW_GRID_HOME}")"
     chmod -R 775 "${NEW_GRID_HOME}"
-    # Create log directory and pre-create log files with correct ownership
-    # so grid/oracle users can append to them via exec >> inside phase scripts
-    mkdir -p "${LOG_DIR}"
-    chmod 775 "${LOG_DIR}"
-    chown root:"${INSTALL_GROUP}" "${LOG_DIR}"
-    for logfile in phase1_grid_prep.log phase2_db_prep.log phase3_switch.log \
-                   phase4_post_install.log phase5_cleanup.log; do
-      touch "${LOG_DIR}/${logfile}"
-      chown root:"${INSTALL_GROUP}" "${LOG_DIR}/${logfile}"
-      chmod 664 "${LOG_DIR}/${logfile}"
-    done
   fi
   run_phase 1 "phase1_grid_prep.sh" \
     "Build and patch new Grid home ${NEW_GRID_HOME}" \
