@@ -43,28 +43,33 @@ chmod -R 775 "${OLD_GRID_HOME}/"
 chown -R "${GRID_USER}:${INSTALL_GROUP}" "${OLD_GRID_HOME}/"
 
 # ── Deinstall old Grid home ────────────────────────────────────────────────────
-log "Running deinstall dry-run for old Grid home..."
+# Run checkonly first (interactive — no -silent flag, they are mutually exclusive)
+log "Running deinstall -checkonly for old Grid home..."
 sudo -u "${GRID_USER}" -i bash -c "
   export CV_ASSUME_DISTID=OEL7.8
   export ORACLE_HOME=${OLD_GRID_HOME}
   export PATH=\$ORACLE_HOME/bin:\$PATH
-  \$ORACLE_HOME/deinstall/deinstall -checkonly -silent 2>&1
-" || log "WARNING: deinstall -checkonly returned non-zero."
+  \$ORACLE_HOME/deinstall/deinstall -checkonly 2>&1
+" || log "WARNING: deinstall -checkonly returned non-zero — review before proceeding."
 
 log "Deinstalling old Grid home ${OLD_GRID_HOME}..."
 sudo -u "${GRID_USER}" -i bash -c "
   export CV_ASSUME_DISTID=OEL7.8
   export ORACLE_HOME=${OLD_GRID_HOME}
   export PATH=\$ORACLE_HOME/bin:\$PATH
-  echo 'y' | \$ORACLE_HOME/deinstall/deinstall -silent 2>&1
+  \$ORACLE_HOME/deinstall/deinstall -silent 2>&1
 " || log "WARNING: Grid home deinstall returned non-zero — verify manually."
 
 # ── Deinstall old DB home ──────────────────────────────────────────────────────
+# CV_ASSUME_DISTID=OEL7.8 is REQUIRED — without it deinstall fails with
+# ERROR: null / NullPointerException in StorageUtil on OL/RHEL 8.
+# This is a known issue (MOS) with the CVU OS check on Oracle Linux 8.
 log "Deinstalling old DB home ${OLD_DB_HOME}..."
 sudo -u "${ORACLE_USER}" -i bash -c "
+  export CV_ASSUME_DISTID=OEL7.8
   export ORACLE_HOME=${OLD_DB_HOME}
   export PATH=\$ORACLE_HOME/bin:\$PATH
-  echo 'y' | \$ORACLE_HOME/deinstall/deinstall -silent 2>&1
+  \$ORACLE_HOME/deinstall/deinstall -silent 2>&1
 " || log "WARNING: DB home deinstall returned non-zero — verify manually."
 
 # ── Remove residual directories ────────────────────────────────────────────────

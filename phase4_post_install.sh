@@ -104,16 +104,16 @@ su - "${ORACLE_USER}" -c "
 "
 log "Database restarted."
 
-# ── Step D: Internal validations and utlrp ────────────────────────────────────
-log "Step D: Running internal validations and recompiling invalid objects..."
+# ── Step D: Recompile invalid objects with utlrp ─────────────────────────────
+# NOTE: SYS.XOQ_VALIDATE and SYS.APS_VALIDATE are NOT called here.
+# These procedures update the database registry for the Oracle OLAP option
+# and are ONLY required when enabling or disabling OLAP using the chopt tool
+# (which is done in Step B above). They are NOT part of standard OOP patching.
+# If chopt is not used in this environment, XOQ_VALIDATE/APS_VALIDATE are
+# never needed.
+log "Step D: Recompiling invalid objects with utlrp..."
 cat > /tmp/phase4_validate.sql << 'SQLEOF'
 SET ECHO OFF FEEDBACK ON SERVEROUTPUT ON
-
-PROMPT === Running XOQ_VALIDATE ===
-EXEC SYS.XOQ_VALIDATE;
-
-PROMPT === Running APS_VALIDATE ===
-EXEC SYS.APS_VALIDATE;
 
 PROMPT === Recompiling invalid objects (utlrp) ===
 @?/rdbms/admin/utlrp
@@ -121,7 +121,7 @@ PROMPT === Recompiling invalid objects (utlrp) ===
 EXIT;
 SQLEOF
 runsql "${DB_INSTANCE}" "${NEW_DB_HOME}" /tmp/phase4_validate.sql
-log "Validation and utlrp complete."
+log "utlrp complete."
 
 # ── Step E: Verify v$option shows FALSE for disabled options ─────────────────
 log "Step E: Verifying disabled options in v\$option..."

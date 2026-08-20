@@ -148,26 +148,15 @@ fi
 # All phase scripts run as root/grid/oracle and must be able to append to log files.
 # Pre-creating them with root:oinstall 664 ensures all users can write.
 if [[ "${DRY_RUN}" != "true" ]]; then
-  log "Setting up staging and log directories..."
-
-  # Fix PATCH_LOC permissions — grid and oracle must be able to create subdirectories
-  # when unzipping the RU combo. PATCH_LOC must be owned by grid:oinstall with 775.
-  if [[ -d "${PATCH_LOC}" ]]; then
-    chown "${GRID_USER}:${INSTALL_GROUP}" "${PATCH_LOC}"
-    chmod 775 "${PATCH_LOC}"
-    log "  PATCH_LOC   : ${PATCH_LOC} → 775 ${GRID_USER}:${INSTALL_GROUP}"
-  else
-    die "PATCH_LOC does not exist: ${PATCH_LOC}"
-  fi
-
-  # Create log directory with group-write so root/grid/oracle can all append
+  log "Pre-creating log directory and log files..."
   mkdir -p "${LOG_DIR}"
   chown root:"${INSTALL_GROUP}" "${LOG_DIR}"
   chmod 775 "${LOG_DIR}"
-  log "  LOG_DIR     : ${LOG_DIR} → 775 root:${INSTALL_GROUP}"
-
-  # Pre-create log files with explicit 664 so all users can append.
-  # chmod 664 sets permissions directly regardless of umask.
+  # Pre-create log files with explicit chmod 664 so grid/oracle can append.
+  # chmod 664 sets permissions directly — no umask change needed.
+  mkdir -p "${LOG_DIR}"
+  chown root:"${INSTALL_GROUP}" "${LOG_DIR}"
+  chmod 775 "${LOG_DIR}"
   for _logfile in \
     phase1_grid_prep.log \
     phase2_db_prep.log \
@@ -183,7 +172,12 @@ if [[ "${DRY_RUN}" != "true" ]]; then
     chmod 664 "${_logpath}"
   done
   unset _logfile _logpath
-  log "  Log files   : 664 root:${INSTALL_GROUP} (pre-created)"
+  log "Log directory: ${LOG_DIR} (log files: 664, umask: 0022)"
+  # Ensure PATCH_LOC staging directory is group-writable so oracle/grid
+  # can extract patches into it. This is a shared NFS staging area, not
+  # an Oracle home — group write here is correct and required.
+  chmod g+w "${PATCH_LOC}"
+  log "Patch staging: ${PATCH_LOC} (group-write enabled for oracle/grid)"
 fi
 
 # ── Phase 1: Online — Build new Grid home ─────────────────────────────────────
@@ -194,10 +188,48 @@ if (( START_PHASE <= 1 && END_PHASE >= 1 )); then
     mkdir -p "${NEW_GRID_HOME}"
     chown -R "${GRID_USER}:${INSTALL_GROUP}" "$(dirname "${NEW_GRID_HOME}")"
     chmod -R 775 "${NEW_GRID_HOME}"
+    # Create log directory and pre-create log files with correct ownership
+    # so grid/oracle users can append to them via exec >> inside phase scripts
+    mkdir -p "${LOG_DIR}"
+    chmod 775 "${LOG_DIR}"
+    chown root:"${INSTALL_GROUP}" "${LOG_DIR}"
+    for logfile in phase1_grid_prep.log phase2_db_prep.log phase3_switch.log \
+                   phase4_post_install.log phase5_cleanup.log; do
+      touch "${LOG_DIR}/${logfile}"
+      chown root:"${INSTALL_GROUP}" "${LOG_DIR}/${logfile}"
+      chmod 664 "${LOG_DIR}/${logfile}"
+    done
   fi
   run_phase 1 "phase1_grid_prep.sh" \
     "Build and patch new Grid home ${NEW_GRID_HOME}" \
     "${GRID_USER}"
+fi
+
+# ── Root.sh path verification — between phase1 and phase3 ────────────────────
+# CRITICAL: After phase1 (gridSetup.sh -applyRU), root.sh, rootmacro.sh, and
+# rootconfig.sh in the new GI home may still reference the old home path.
+# With the CRS_SWONLY + new ORACLE_HOME in the response file (phase1 fix),
+# this should not occur — but we verify and auto-fix as belt-and-suspenders.
+# This check runs regardless of phase selection to ensure safety.
+if (( START_PHASE <= 1 && END_PHASE >= 3 )) && [[ "${DRY_RUN}" != "true" ]]; then
+  log ""
+  log "POST-PHASE 1: Verifying root script paths in new GI home..."
+  for _script in \
+    "${NEW_GRID_HOME}/root.sh" \
+    "${NEW_GRID_HOME}/install/utl/rootmacro.sh" \
+    "${NEW_GRID_HOME}/crs/config/rootconfig.sh"; do
+    [[ ! -f "${_script}" ]] && continue
+    _old_count=$(grep -c "${OLD_GRID_HOME}" "${_script}" 2>/dev/null || true)
+    if (( _old_count > 0 )); then
+      log "  FIXING: ${_old_count} old path(s) in $(basename ${_script})"
+      sed -i "s|${OLD_GRID_HOME}|${NEW_GRID_HOME}|g" "${_script}"
+      log "  FIXED: $(basename ${_script})"
+    else
+      log "  OK: $(basename ${_script})"
+    fi
+  done
+  unset _script _old_count
+  log "  Root script verification complete."
 fi
 
 # ── Phase 2: Online — Build new DB home ───────────────────────────────────────
@@ -208,6 +240,13 @@ if (( START_PHASE <= 2 && END_PHASE >= 2 )); then
     mkdir -p "${NEW_DB_HOME}"
     chown -R "${ORACLE_USER}:${INSTALL_GROUP}" "${NEW_DB_HOME}"
     chmod -R 775 "${NEW_DB_HOME}"
+    # Fix diag directory ownership — required for kfod ADR initialization.
+    # AutoUpgrade calls kfod from the source home to check FRA free space.
+    # If diag is owned by grid (set during GI install) kfod cannot initialize
+    # ADR and AutoUpgrade analyze fails with COM-115 / DISK_SPACE_FOR_RECOVERY_AREA.
+    log "  Fixing diag directory ownership for oracle user..."
+    chown -R "${ORACLE_USER}:${INSTALL_GROUP}" "${ORACLE_BASE}/diag" 2>/dev/null || true
+    log "  diag ownership set to ${ORACLE_USER}:${INSTALL_GROUP}"
   fi
   run_phase 2 "phase2_db_prep.sh" \
     "Build and patch new DB home ${NEW_DB_HOME}" \
