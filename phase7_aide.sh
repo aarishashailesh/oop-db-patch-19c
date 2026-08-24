@@ -27,11 +27,15 @@ die() { log "CRITICAL ERROR: $*"; exit 1; }
 
 log "=== PHASE 7: AIDE Integrity Database Reset ==="
 
+# -- Phase gate: Require phases 1 2 3 4 to have completed ------
+require_phase_complete 1 2 3 4 5 6
+
 # ── Verify AIDE is installed ──────────────────────────────────────────────────
 if ! command -v aide &>/dev/null; then
   log "WARNING: aide command not found — skipping AIDE reset."
   log "Install with: dnf install -y aide"
-  log "=== PHASE 7 SKIPPED (AIDE not installed) ==="
+  mark_phase_complete 7
+log "=== PHASE 7 SKIPPED (AIDE not installed) ==="
   exit 0
 fi
 
@@ -96,4 +100,5 @@ MASTER_SIZE=$(stat -c%s "${AIDE_MASTER_DB}")
 log "Master AIDE database: ${AIDE_MASTER_DB} (${MASTER_SIZE} bytes)"
 log "Future aide --check runs will use this as the new baseline."
 
+mark_phase_complete 7
 log "=== PHASE 7 COMPLETE ==="

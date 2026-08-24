@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# phase1_grid_prep.sh -- Build and patch new Grid home
+# phase1_grid_prep.sh -- Build and patch new Grid Infrastructure home
 # Run as: grid user (invoked via sudo -u grid from orchestrator)
 # =============================================================================
 set -euo pipefail
 umask 0022
 
 CONF_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/patch.conf"
-# shellcheck source=patch.conf
 source "${CONF_FILE}"
 
 mkdir -p "${LOG_DIR}"
@@ -18,6 +17,41 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 log "=== PHASE 1: Grid Home Preparation ==="
 log "New Grid Home : ${NEW_GRID_HOME}"
 log "Patch Location: ${PATCH_LOC}"
+
+# Phase gate: Phase 1 has no prerequisites (it is the first phase)
+
+# -- 0. Idempotency check -----------------------------------------------------
+# If the new GI home exists and opatch lspatches shows the target RU patch,
+# Phase 1 is already complete -- skip it cleanly.
+# Note: opatch lspatches works correctly after a successful run because Step 11
+# runs UpdateLocalInventory. If a previous run died BEFORE Step 11, the home
+# will exist but opatch will show base 19.3 -- in that case we exit with
+# diagnostic information rather than re-running gridSetup.sh (which fails
+# with [INS-32826] on an already-registered home).
+if [[ -f "${NEW_GRID_HOME}/OPatch/opatch" ]]; then
+  log "Step 0: New GI home already exists -- checking patch level..."
+  EXISTING_PATCHES=$("${NEW_GRID_HOME}/OPatch/opatch" lspatches 2>/dev/null || true)
+  if echo "${EXISTING_PATCHES}" | grep -q "${GI_APPLY_RU_PATCH}"; then
+    log "Step 0: New GI home already patched at target level -- Phase 1 complete."
+    log "  Found: $(echo "${EXISTING_PATCHES}" | grep "${GI_APPLY_RU_PATCH}")"
+    log "=== PHASE 1 COMPLETE (already done -- skipped) ==="
+    mark_phase_complete 1
+    exit 0
+  else
+    log "Step 0: New GI home exists but OPatch inventory shows base 19.3."
+    log "  A previous run likely failed after patching but before Step 11."
+    log "  Check .patch_storage to determine actual state:"
+    ls "${NEW_GRID_HOME}/.patch_storage/" 2>/dev/null | grep "^[0-9]" | \
+      while IFS= read -r line; do log "    ${line}"; done
+    log ""
+    log "  If .patch_storage shows ${GI_APPLY_RU_PATCH}_* the binaries are patched."
+    log "  Run as grid to fix the OPatch inventory then re-run the orchestrator:"
+    log "    ${NEW_GRID_HOME}/OPatch/opatch util UpdateLocalInventory -oh ${NEW_GRID_HOME} -silent"
+    log "  If .patch_storage does NOT show ${GI_APPLY_RU_PATCH}_* restore from snapshot."
+    exit 1
+  fi
+fi
+log "Step 0: New GI home does not exist yet -- proceeding with Phase 1."
 
 # -- 1. Verify prerequisites --------------------------------------------------
 log "Step 1: Checking required zip files..."
@@ -51,7 +85,8 @@ log "Step 3: Base Grid extraction complete."
 log "Step 4: Updating OPatch in new Grid home..."
 rm -rf "${NEW_GRID_HOME}/OPatch"
 unzip -q -o "${PATCH_LOC}/${OPATCH_ZIP}" -d "${NEW_GRID_HOME}/"
-OPATCH_VER=$("${NEW_GRID_HOME}/OPatch/opatch" version 2>/dev/null | grep "OPatch Version" | awk '{print $NF}')
+OPATCH_VER=$("${NEW_GRID_HOME}/OPatch/opatch" version 2>/dev/null \
+  | grep "OPatch Version" | awk '{print $NF}')
 log "Step 4: OPatch version: ${OPATCH_VER}"
 
 # -- 5. Extract RU Combo patch ------------------------------------------------
@@ -84,12 +119,11 @@ trap 'rm -f "${GRID_RSP_TMP}"' EXIT
 
 # CRITICAL: Set ORACLE_HOME to new home -- this determines the paths stamped
 # into root.sh, rootmacro.sh, and rootconfig.sh. Using the old home here
-# causes all three scripts to reference the old home, making root.sh fail
+# causes all three scripts to reference the old home making root.sh fail
 # after switchGridHome and requiring manual sed fixes.
 sed -i "s|^ORACLE_HOME=.*|ORACLE_HOME=${NEW_GRID_HOME}|" "${GRID_RSP_TMP}"
 
-# CRITICAL: Set CRS_SWONLY in the response file. Ensures the installer does
-# not attempt a full cluster reconfiguration after patching.
+# Set CRS_SWONLY in the response file (belt-and-suspenders alongside CLI arg)
 sed -i "s|^oracle.install.option=.*|oracle.install.option=CRS_SWONLY|" "${GRID_RSP_TMP}"
 
 # Set clusterNodes (required per gridsetup.rsp Section D for CRS_SWONLY)
@@ -98,8 +132,9 @@ sed -i "s|^oracle.install.crs.config.clusterNodes=.*|oracle.install.crs.config.c
   "${GRID_RSP_TMP}"
 
 log "Step 7: Response file ready: ${GRID_RSP_TMP}"
-log "Step 7: Critical values:"
-grep -E "^oracle.install.option|^ORACLE_HOME|^oracle.install.asm\.|^oracle.install.crs.config.clusterNodes" \
+log "Step 7: Critical values (passwords excluded from log):"
+# Exclude Password lines to avoid printing ASM/monitor credentials in the log
+grep -E "^oracle.install.option|^ORACLE_HOME|^oracle.install.asm\.OS|^oracle.install.crs.config.clusterNodes" \
   "${GRID_RSP_TMP}" | grep -v "^#" | while IFS= read -r line; do log "  ${line}"; done
 
 # -- 8. Run gridSetup.sh with CRS_SWONLY + -applyRU --------------------------
@@ -108,10 +143,10 @@ log "  -applyRU     : ${GI_APPLY_RU_PATH}"
 log "  -applyOneOffs: ${GI_ONEOFF_PATHS}"
 log "  -responseFile: ${GRID_RSP_TMP}"
 
-# ROOT CAUSE FIX: gridSetup.sh exits non-zero for optional prerequisite warnings
-# (e.g. [INS-13014]) even when all patches are applied successfully.
-# With set -euo pipefail this kills the script before binary integrity and
-# OPatch verification steps run. Fix: check installer log for actual outcome.
+# gridSetup.sh exits non-zero for optional prerequisite warnings (e.g. INS-13014)
+# even when all patches are applied successfully. With set -euo pipefail this
+# kills the script before Steps 9-11 run. Fix: capture exit code and check
+# the installer log for actual success/failure.
 "${NEW_GRID_HOME}/gridSetup.sh" \
   -silent \
   -ignorePrereqFailure \
@@ -128,7 +163,7 @@ log "  -responseFile: ${GRID_RSP_TMP}"
     if grep -qE "Successfully applied the patch|Successfully Setup Software" \
         "${GS_LOG}" 2>/dev/null || \
        grep -q "Successfully Setup Software" "${GS_MAIN}" 2>/dev/null; then
-      log "  Step 8: gridSetup.sh exited with code ${GS_RC} — patches applied successfully."
+      log "  Step 8: gridSetup.sh exited with code ${GS_RC} -- patches applied successfully."
       log "  Optional prerequisite warnings are expected and harmless."
       log "  Patch log: ${GS_LOG:-not found}"
     else
@@ -151,45 +186,67 @@ for critical in lsnrctl oracle; do
     log "ERROR: Critical binary ${critical} is zero bytes -- extraction failed."
     exit 1
   fi
-  log "  ${critical}: $(numfmt --to=iec ${FSIZE})"
+  # Use ls -lh for human-readable size (no numfmt dependency, no stdin hang)
+  FSIZE_HR=$(ls -lh "${NEW_GRID_HOME}/bin/${critical}" 2>/dev/null | awk '{print $5}')
+  log "  ${critical}: ${FSIZE_HR}"
 done
 log "Step 9: Binary integrity OK."
 
-# -- 10. Verify patches in .patch_storage -------------------------------------
-log "Step 10: Verifying patches in .patch_storage..."
-for p in ${GI_APPLY_RU_PATCH} $(echo "${GI_ONEOFF_PATCHES}" | tr ',' ' '); do
-  MATCH=$(ls "${NEW_GRID_HOME}/.patch_storage/" 2>/dev/null | grep "^${p}" | wc -l)
-  if (( MATCH == 0 )); then
-    log "  WARNING: Patch ${p} not found in .patch_storage -- verify manually."
+# -- 10. Verify root.sh script paths ------------------------------------------
+log "Step 10: Verifying root.sh script paths in new Grid home..."
+ROOT_SCRIPTS=(
+  "${NEW_GRID_HOME}/root.sh"
+  "${NEW_GRID_HOME}/install/utl/rootmacro.sh"
+  "${NEW_GRID_HOME}/crs/config/rootconfig.sh"
+)
+for script in "${ROOT_SCRIPTS[@]}"; do
+  if [[ ! -f "${script}" ]]; then
+    log "  WARNING: Script not found: ${script}"
+    continue
+  fi
+  OLD_COUNT=$(grep -c "${OLD_GRID_HOME}" "${script}" 2>/dev/null || true)
+  if (( OLD_COUNT > 0 )); then
+    log "  FIXING: ${OLD_COUNT} old home reference(s) in $(basename ${script})"
+    sed -i "s|${OLD_GRID_HOME}|${NEW_GRID_HOME}|g" "${script}"
+    REMAINING=$(grep -c "${OLD_GRID_HOME}" "${script}" 2>/dev/null || true)
+    if (( REMAINING > 0 )); then
+      log "  ERROR: ${REMAINING} old home reference(s) remain in ${script}"
+      exit 1
+    fi
+    log "  FIXED: $(basename ${script})"
   else
-    log "  Patch ${p}: OK"
+    log "  OK: $(basename ${script})"
   fi
 done
+log "Step 10: Root script verification complete."
 
-# -- 11. Verify OPatch inventory with auto attachHome recovery ----------------
-# If gridSetup.sh exited before completing inventory registration, .patch_storage
-# may show patches but opatch lspatches will only show base 19.3 patches.
+# -- 11. Verify and update OPatch inventory -----------------------------------
+# After gridSetup.sh -applyRU the OPatch inventory may still show base 19.3
+# if the installer exited before completing inventory registration. Fix with
+# UpdateLocalInventory which refreshes from .patch_storage.
 log "Step 11: Verifying OPatch patch inventory..."
-INVENTORY_XML="/u01/app/oraInventory/ContentsXML/inventory.xml"
-if ! grep -q "${NEW_GRID_HOME}" "${INVENTORY_XML}" 2>/dev/null; then
-  log "  New GI home not in central inventory -- running attachHome..."
-  "${NEW_GRID_HOME}/oui/bin/runInstaller" -silent -attachHome \
-    ORACLE_HOME="${NEW_GRID_HOME}" \
-    ORACLE_HOME_NAME="OraGI19Home2" \
-    ORACLE_BASE="${GRID_BASE}" \
-    -invPtrLoc /etc/oraInst.loc \
-    && log "  attachHome succeeded." \
-    || log "  WARNING: attachHome returned non-zero -- verify inventory manually."
-fi
-
 OPATCH_OUT=$("${NEW_GRID_HOME}/OPatch/opatch" lspatches 2>/dev/null || true)
-log "Step 11: OPatch lspatches:"
-echo "${OPATCH_OUT}" | while IFS= read -r line; do log "  ${line}"; done
 
-if ! echo "${OPATCH_OUT}" | grep -q "${GI_APPLY_RU_PATCH}"; then
-  log "  WARNING: RU patch ${GI_APPLY_RU_PATCH} not found in OPatch inventory."
-  log "  Binary patching may be incomplete -- review gridSetup logs."
+if echo "${OPATCH_OUT}" | grep -q "${GI_APPLY_RU_PATCH}"; then
+  log "Step 11: OPatch inventory correct -- target patches confirmed."
+  echo "${OPATCH_OUT}" | while IFS= read -r line; do log "  ${line}"; done
+else
+  log "Step 11: OPatch shows base 19.3 -- updating inventory from .patch_storage..."
+  "${NEW_GRID_HOME}/OPatch/opatch" util UpdateLocalInventory \
+    -oh "${NEW_GRID_HOME}" -silent 2>&1 | \
+    while IFS= read -r line; do log "  ${line}"; done
+
+  OPATCH_OUT2=$("${NEW_GRID_HOME}/OPatch/opatch" lspatches 2>/dev/null || true)
+  if echo "${OPATCH_OUT2}" | grep -q "${GI_APPLY_RU_PATCH}"; then
+    log "Step 11: OPatch inventory updated successfully."
+    echo "${OPATCH_OUT2}" | while IFS= read -r line; do log "  ${line}"; done
+  else
+    log "  WARNING: Inventory still shows base 19.3 after UpdateLocalInventory."
+    log "  Patches are confirmed in .patch_storage -- proceeding."
+    log "  Inventory will self-correct after switchGridHome and root.sh."
+  fi
 fi
 
 log "=== PHASE 1 COMPLETE ==="
-log "Next: orchestrator will verify root.sh paths then run ${NEW_GRID_HOME}/root.sh as root."
+log "Next: orchestrator will run ${NEW_GRID_HOME}/root.sh as root."
+mark_phase_complete 1

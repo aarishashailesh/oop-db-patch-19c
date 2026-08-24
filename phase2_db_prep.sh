@@ -18,7 +18,30 @@ log "=== PHASE 2: Database Home Preparation ==="
 log "New DB Home   : ${NEW_DB_HOME}"
 log "Patch Location: ${PATCH_LOC}"
 
-# -- 1. Verify prerequisites --------------------------------------------------
+# -- Phase gate: Require Phase 1 to have completed ----------------------------
+require_phase_complete 1
+
+# -- 0. Idempotency check — skip or abort if DB home already exists -----------
+if [[ -f "${NEW_DB_HOME}/OPatch/opatch" ]]; then
+  log "Step 0: New DB home already exists — checking patch level..."
+  EXISTING_PATCHES=$("${NEW_DB_HOME}/OPatch/opatch" lspatches 2>/dev/null || true)
+  if echo "${EXISTING_PATCHES}" | grep -q "${DB_APPLY_RU_PATCH}"; then
+    log "Step 0: New DB home already patched at target level — Phase 2 complete."
+    log "  Found: $(echo "${EXISTING_PATCHES}" | grep "${DB_APPLY_RU_PATCH}")"
+    log "=== PHASE 2 COMPLETE (already done — skipped) ==="
+    mark_phase_complete 2
+    exit 0
+  else
+    log "Step 0: New DB home exists but is NOT at target patch level."
+    log "  Current patches: ${EXISTING_PATCHES}"
+    log "ERROR: Partial DB home detected. Clean up before re-running:"
+    log "  1. rm -rf ${NEW_DB_HOME}"
+    log "  2. rm -rf ${PATCH_LOC}/${DB_RU_STANDALONE_PATCH}"
+    log "  3. Then re-run the orchestrator."
+    exit 1
+  fi
+fi
+log "Step 0: New DB home does not exist yet — proceeding with Phase 2."
 log "Step 1: Checking required zip files..."
 for f in \
   "${BASE_SW_DIR}/${DB_BASE_ZIP}" \
@@ -179,10 +202,33 @@ fi
 
 # Wait for analyze jobs to complete and validate status log
 log "Step 9: Waiting for AutoUpgrade analyze to complete..."
-ANALYZE_STATUS_LOG="${ADR_BASE}/admin/upg_logs/cfgtoollogs/upgrade/auto/status/status.log"
+# Status log is under global.autoupg_log_dir defined in orcl_auto_patch.cfg.
+# Read it directly from the config file to avoid duplication in patch.conf.
+AUTOUPGRADE_LOG_DIR=$(grep "^global.autoupg_log_dir=" "${AUTOUPGRADE_CFG}" \
+  2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+if [[ -z "${AUTOUPGRADE_LOG_DIR}" ]]; then
+  log "ERROR: global.autoupg_log_dir not found in ${AUTOUPGRADE_CFG}"
+  exit 1
+fi
+log "  AutoUpgrade log dir: ${AUTOUPGRADE_LOG_DIR}"
+ANALYZE_STATUS_LOG="${AUTOUPGRADE_LOG_DIR}/cfgtoollogs/upgrade/auto/status/status.log"
 MAX_WAIT=600
 ELAPSED=0
 SLEEP_INTERVAL=30
+
+# Check immediately first — analyze may have already completed during the
+# Java process execution before the wait loop started
+if [[ -f "${ANALYZE_STATUS_LOG}" ]] && \
+   grep -q "Status.*SUCCESS" "${ANALYZE_STATUS_LOG}" 2>/dev/null; then
+  log "Step 9: AutoUpgrade analyze already completed successfully."
+  grep -E "Status|Version Before|Version After|Stage Name|Duration" \
+    "${ANALYZE_STATUS_LOG}" | while IFS= read -r line; do log "  ${line}"; done
+  log "Step 9: AutoUpgrade analyze complete."
+  log "  Status log: ${ANALYZE_STATUS_LOG}"
+  log "=== PHASE 2 COMPLETE ==="
+  mark_phase_complete 2
+  exit 0
+fi
 
 while (( ELAPSED < MAX_WAIT )); do
   if [[ -f "${ANALYZE_STATUS_LOG}" ]]; then
@@ -211,4 +257,5 @@ fi
 log "Step 9: AutoUpgrade analyze complete."
 log "  Status log: ${ANALYZE_STATUS_LOG}"
 
+mark_phase_complete 2
 log "=== PHASE 2 COMPLETE ==="

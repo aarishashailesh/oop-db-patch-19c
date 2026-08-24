@@ -20,6 +20,9 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 die() { log "CRITICAL ERROR: $*"; exit 1; }
 
 log "=== PHASE 5: Old Home Cleanup ==="
+
+# -- Phase gate: Require phases 1 2 3 4 to have completed ------
+require_phase_complete 1 2 3 4
 log "Old Grid Home: ${OLD_GRID_HOME}"
 log "Old DB Home  : ${OLD_DB_HOME}"
 
@@ -106,4 +109,5 @@ log "Final verification..."
 
 cat /u01/app/oraInventory/ContentsXML/inventory.xml | grep -i "HOME NAME\|LOC="
 
+mark_phase_complete 5
 log "=== PHASE 5 COMPLETE ==="

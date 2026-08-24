@@ -20,6 +20,9 @@ exec >> "${LOG_DIR}/phase6_security.log" 2>&1
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 log "=== PHASE 6: Security Hardening ==="
+
+# -- Phase gate: Require phases 1 2 3 4 to have completed ------
+require_phase_complete 1 2 3 4 5
 log "New DB Home: ${NEW_DB_HOME}"
 
 # ── Step F: Create fips.ora ───────────────────────────────────────────────────
@@ -68,4 +71,5 @@ log "Verification:"
 [[ -f "${EXTPROC_PATH}.orig" ]] && log "  extproc.orig: Present" \
                                  || log "  extproc.orig: Not found"
 
+mark_phase_complete 6
 log "=== PHASE 6 COMPLETE ==="

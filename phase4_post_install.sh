@@ -37,6 +37,9 @@ runsql() {
 }
 
 log "=== PHASE 4: Post-Installation Tasks ==="
+
+# -- Phase gate: Require phases 1 2 3 to have completed ------
+require_phase_complete 1 2 3
 log "New DB Home: ${NEW_DB_HOME}"
 log "New Grid Home: ${NEW_GRID_HOME}"
 
@@ -170,6 +173,7 @@ log "Step G: Verifying Grid patch level and resource status..."
 # ── Cleanup temp SQL files ─────────────────────────────────────────────────────
 rm -f /tmp/phase4_pre_invalids.sql /tmp/phase4_validate.sql /tmp/phase4_voption.sql
 
+mark_phase_complete 4
 log "=== PHASE 4 COMPLETE ==="
 log ""
 log "Review validation report: ${LOG_DIR}/phase4_validation.log"

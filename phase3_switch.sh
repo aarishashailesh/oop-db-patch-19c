@@ -19,6 +19,9 @@ rungrid()   { su - "${GRID_USER}"   -c "$1"; }
 runoracle() { su - "${ORACLE_USER}" -c "$1"; }
 
 log "=== PHASE 3: Grid and Database Home Switch ==="
+
+# -- Phase gate: Require phases 1 2 to have completed ------
+require_phase_complete 1 2
 log "Old Grid Home: ${OLD_GRID_HOME}"
 log "New Grid Home: ${NEW_GRID_HOME}"
 log "Old DB Home  : ${OLD_DB_HOME}"
@@ -27,26 +30,43 @@ log "New DB Home  : ${NEW_DB_HOME}"
 NODE_NAME=$(/usr/bin/hostname -s)
 log "Node: ${NODE_NAME}"
 
-# ── Step 0: Stop database and listener (OUTAGE BEGINS) ───────────────────────
+# -- GI switch idempotency check ----------------------------------------------
+# Check if CRS is already running from the new GI home. This happens when
+# Phase 3 is re-run after a partial failure where Steps 1-6 completed but
+# Step 7 (AutoUpgrade deploy) failed. In that case gridSetup.sh -switchGridHome
+# will fail with [INS-45102] "cannot move from active clusterware home".
+# Detect this and skip directly to AutoUpgrade deploy.
+GI_SWITCH_DONE=false
+OCSSD_HOME=$(ls -la /proc/$(pgrep -f ocssd.bin 2>/dev/null | head -1)/exe \
+  2>/dev/null | awk '{print $NF}' | xargs dirname 2>/dev/null | xargs dirname 2>/dev/null || true)
+if [[ "${OCSSD_HOME}" == "${NEW_GRID_HOME}" ]]; then
+  log "GI switch already complete -- ocssd.bin running from new home."
+  log "  Skipping Steps 0-6 (listener stop, switchGridHome, root.sh, CRS verify)."
+  log "  Proceeding directly to Step 7 (AutoUpgrade deploy)."
+  GI_SWITCH_DONE=true
+fi
+
+if [[ "${GI_SWITCH_DONE}" != "true" ]]; then
+# The listener must be stopped before switchGridHome.
+# NOTE: Do NOT shut down the database here. AutoUpgrade deploy mode handles
+# the database shutdown and restart internally as part of its deploy workflow.
+# Shutting down the database before AutoUpgrade deploy causes:
+#   "Unable to connect to database -- ORA-01034: ORACLE not available"
+# because AutoUpgrade needs to connect to the source home database first.
+#
 # Listener must be stopped as grid via srvctl — NOT as oracle via lsnrctl.
 # Running lsnrctl stop as oracle fails with TNS-01190 on GI installations
 # because the listener is a CRS-managed resource owned by the grid user.
-log "Step 0: Stopping database and listener (OUTAGE START)..."
+log "Step 0: Stopping listener (OUTAGE START)..."
 rungrid "
   export ORACLE_HOME=${OLD_GRID_HOME}
   export PATH=\${ORACLE_HOME}/bin:/usr/local/bin:/usr/bin:/bin
-  echo 'Stopping database ${DB_NAME}...'
-  \${ORACLE_HOME}/bin/srvctl stop database -d ${DB_NAME}
   echo 'Stopping listener...'
   \${ORACLE_HOME}/bin/srvctl stop listener -l LISTENER
   echo 'Verifying listener stopped:'
   \${ORACLE_HOME}/bin/srvctl status listener
 "
-# Verify database pmon is gone
-if pgrep -f "ora_pmon_${DB_NAME}" > /dev/null 2>&1; then
-  die "ora_pmon_${DB_NAME} still running after shutdown — aborting."
-fi
-log "  Database and listener confirmed stopped."
+log "  Listener stopped. Database left running for AutoUpgrade deploy."
 
 # ── Step 1: Create switchGridHome response file ───────────────────────────────
 # CRITICAL: switchGridHome requires a response file with correct ASM group names.
@@ -171,6 +191,8 @@ for profile in "${GRID_HOME_DIR}/.bash_profile" "${GRID_HOME_DIR}/.bashrc"; do
   fi
 done
 
+fi # end if [[ "${GI_SWITCH_DONE}" != "true" ]]
+
 # ── Step 7: AutoUpgrade deploy (as oracle) ────────────────────────────────────
 # NOTE: runInstaller -switchOracleHome and its root.sh are NOT needed when
 # using AutoUpgrade -mode deploy. AutoUpgrade handles the DB home switch
@@ -209,25 +231,41 @@ runoracle "
 
 # Wait for AutoUpgrade deploy to complete
 log "  Waiting for AutoUpgrade deploy to complete (up to 60 min)..."
-DEPLOY_STATUS_LOG="${ORACLE_BASE}/admin/upg_logs/cfgtoollogs/upgrade/auto/status/status.log"
+# Read log dir from orcl_auto_patch.cfg to avoid duplication with patch.conf
+AUTOUPGRADE_LOG_DIR=$(grep "^global.autoupg_log_dir=" "${AUTOUPGRADE_CFG}" \
+  2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+DEPLOY_STATUS_LOG="${AUTOUPGRADE_LOG_DIR}/cfgtoollogs/upgrade/auto/status/status.log"
+log "  Deploy status log: ${DEPLOY_STATUS_LOG}"
 MAX_WAIT=3600; ELAPSED=0; SLEEP_INTERVAL=30
+
+# Check immediately first — deploy may have completed during Java execution
+if [[ -f "${DEPLOY_STATUS_LOG}" ]] && \
+   grep -q "Status.*SUCCESS" "${DEPLOY_STATUS_LOG}" 2>/dev/null; then
+  log "  AutoUpgrade deploy already completed successfully."
+  grep -E "Status|Version Before|Version After|Duration" \
+    "${DEPLOY_STATUS_LOG}" | while IFS= read -r line; do log "  ${line}"; done
+  ELAPSED=${MAX_WAIT}  # skip the polling loop
+fi
 while (( ELAPSED < MAX_WAIT )); do
   if [[ -f "${DEPLOY_STATUS_LOG}" ]]; then
     if grep -q "Status.*SUCCESS" "${DEPLOY_STATUS_LOG}" 2>/dev/null; then
       log "  AutoUpgrade deploy completed successfully."
       grep -E "Status|Version Before|Version After|Duration" \
         "${DEPLOY_STATUS_LOG}" | while IFS= read -r line; do log "  ${line}"; done
+      ELAPSED=${MAX_WAIT}
       break
     elif grep -q "Status.*ERROR\|Status.*FAILED" "${DEPLOY_STATUS_LOG}" 2>/dev/null; then
       log "ERROR: AutoUpgrade deploy failed."
       cat "${DEPLOY_STATUS_LOG}" | while IFS= read -r line; do log "  ${line}"; done
-      die "AutoUpgrade deploy failed — review: ${ORACLE_BASE}/admin/upg_logs/"
+      die "AutoUpgrade deploy failed -- review: ${AUTOUPGRADE_LOG_DIR}/"
     fi
   fi
   sleep ${SLEEP_INTERVAL}; (( ELAPSED += SLEEP_INTERVAL ))
   log "  Deploy in progress... ${ELAPSED}s elapsed"
 done
-(( ELAPSED >= MAX_WAIT )) && die "AutoUpgrade deploy timed out after ${MAX_WAIT}s"
+if (( ELAPSED < MAX_WAIT )); then
+  die "AutoUpgrade deploy timed out after ${MAX_WAIT}s"
+fi
 
 log "AutoUpgrade deploy complete."
 
@@ -248,6 +286,7 @@ if ! grep -q "ADR_BASE" "${ORACLE_HOME_DIR}/.bash_profile" 2>/dev/null; then
   log "  Added ADR_BASE to ${ORACLE_HOME_DIR}/.bash_profile"
 fi
 
+mark_phase_complete 3
 log "=== PHASE 3 COMPLETE ==="
 log ""
 log "Verify with:"

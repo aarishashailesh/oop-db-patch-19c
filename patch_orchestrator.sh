@@ -4,7 +4,7 @@
 # Run as: root
 #
 # USAGE:
-#   ./patch_orchestrator.sh [--phase <1-7>] [--from-phase <n>] [--dry-run]
+#   ./patch_orchestrator.sh [--phase <1-7>] [--from-phase <n>] [--dry-run] [--reset-status]
 #
 # OPTIONS:
 #   --phase <n>      Run only phase n (1-7)
@@ -12,6 +12,9 @@
 #   --dry-run        Print what would be done without executing
 #   --cleanup        Also run phase 5 cleanup (off by default — run manually)
 #   --full           Run all phases 1-7 including cleanup, security, AIDE
+#   --reset-status   Clear all phase completion markers before running.
+#                    Use after a snapshot restore or clean retry to allow
+#                    phases to run again even if markers exist from a prior run.
 #
 # PHASES:
 #   1  phase1_grid_prep.sh    Build and patch new Grid home      (online)
@@ -41,17 +44,19 @@ START_PHASE=1
 END_PHASE=4    # Phase 5 (cleanup) and beyond are opt-in only
 DRY_RUN=false
 SINGLE_PHASE=""
+RESET_STATUS=false
 
 # ── Parse arguments ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --phase)       SINGLE_PHASE="$2"; START_PHASE="$2"; END_PHASE="$2"; shift 2 ;;
-    --from-phase)  START_PHASE="$2"; shift 2 ;;
-    --dry-run)     DRY_RUN=true; shift ;;
-    --cleanup)     END_PHASE=5; shift ;;
-    --full)        END_PHASE=7; shift ;;
+    --phase)         SINGLE_PHASE="$2"; START_PHASE="$2"; END_PHASE="$2"; shift 2 ;;
+    --from-phase)    START_PHASE="$2"; shift 2 ;;
+    --dry-run)       DRY_RUN=true; shift ;;
+    --cleanup)       END_PHASE=5; shift ;;
+    --full)          END_PHASE=7; shift ;;
+    --reset-status)  RESET_STATUS=true; shift ;;
     --help|-h)
-      sed -n '3,25p' "$0"
+      sed -n '3,27p' "$0"
       exit 0
       ;;
     *) echo "Unknown option: $1"; exit 1 ;;
@@ -127,6 +132,7 @@ log "New DB Home  : ${NEW_DB_HOME}"
 log "Patch staging: ${PATCH_LOC}"
 log "Running phases: ${START_PHASE} to ${END_PHASE}"
 log "Dry run      : ${DRY_RUN}"
+log "Reset status : ${RESET_STATUS}"
 log "==========================================================="
 
 # Verify patch.conf has essential values
@@ -173,6 +179,24 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   done
   unset _logfile _logpath
   log "Log directory: ${LOG_DIR} (log files: 664, umask: 0022)"
+
+  # Create phase status directory — stores success markers used by phase gate
+  # functions (require_phase_complete / mark_phase_complete) to enforce
+  # sequential execution. Grid/oracle users write markers here on phase completion.
+  mkdir -p "${STATUS_DIR}"
+  chown root:"${INSTALL_GROUP}" "${STATUS_DIR}"
+  chmod 775 "${STATUS_DIR}"
+  log "Phase status dir: ${STATUS_DIR}"
+
+  # --reset-status flag: remove all phase markers so the run starts fresh.
+  # Use when re-running after a snapshot restore or a clean retry.
+  # Usage: patch_orchestrator.sh --reset-status --phase 1
+  if [[ "${RESET_STATUS:-false}" == "true" ]]; then
+    log "WARNING: --reset-status specified — removing all phase completion markers."
+    rm -f "${STATUS_DIR}"/phase*.done
+    log "  All phase markers cleared. Phases will run from scratch."
+  fi
+
   # Ensure PATCH_LOC staging directory is group-writable so oracle/grid
   # can extract patches into it. This is a shared NFS staging area, not
   # an Oracle home — group write here is correct and required.
@@ -185,11 +209,19 @@ if (( START_PHASE <= 1 && END_PHASE >= 1 )); then
   log ""
   log "PRE-PHASE 1: Creating Grid home directory structure..."
   if [[ "${DRY_RUN}" != "true" ]]; then
-    mkdir -p "${NEW_GRID_HOME}"
-    chown -R "${GRID_USER}:${INSTALL_GROUP}" "$(dirname "${NEW_GRID_HOME}")"
-    chmod -R 775 "${NEW_GRID_HOME}"
-    # Create log directory and pre-create log files with correct ownership
-    # so grid/oracle users can append to them via exec >> inside phase scripts
+    # Only create directory if it doesn't already exist.
+    # If it exists and is partially populated, phase1's idempotency check
+    # will either skip cleanly (already patched) or exit with cleanup instructions.
+    if [[ ! -d "${NEW_GRID_HOME}" ]]; then
+      mkdir -p "${NEW_GRID_HOME}"
+      chown -R "${GRID_USER}:${INSTALL_GROUP}" "$(dirname "${NEW_GRID_HOME}")"
+      chmod -R 775 "${NEW_GRID_HOME}"
+    else
+      log "  GI home directory already exists: ${NEW_GRID_HOME}"
+      log "  Phase 1 idempotency check will determine if patching is needed."
+    fi
+    # Always ensure log directory and pre-created log files exist with
+    # correct ownership so grid/oracle users can append via exec >>
     mkdir -p "${LOG_DIR}"
     chmod 775 "${LOG_DIR}"
     chown root:"${INSTALL_GROUP}" "${LOG_DIR}"
