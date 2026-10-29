@@ -21,16 +21,19 @@ log "Patch Location: ${PATCH_LOC}"
 # -- Phase gate: Require Phase 1 to have completed ----------------------------
 require_phase_complete 1
 
-# -- 0. Idempotency check — skip or abort if DB home already exists -----------
-if [[ -f "${NEW_DB_HOME}/OPatch/opatch" ]]; then
-  log "Step 0: New DB home already exists — checking patch level..."
+# -- 0. Resume detection -- decide which step to start from --------------------
+# PHASE2_FROM_STEP may be exported to force a starting step (1-9).
+# If the new DB home already exists at the target patch level, Steps 1-7 are
+# skipped automatically and the script continues at Step 8 (AutoUpgrade JAR +
+# analyze). Phase 2 is only marked complete after the analyze passes.
+FROM_STEP="${PHASE2_FROM_STEP:-1}"
+if (( FROM_STEP == 1 )) && [[ -f "${NEW_DB_HOME}/OPatch/opatch" ]]; then
+  log "Step 0: New DB home already exists -- checking patch level..."
   EXISTING_PATCHES=$("${NEW_DB_HOME}/OPatch/opatch" lspatches 2>/dev/null || true)
   if echo "${EXISTING_PATCHES}" | grep -q "${DB_APPLY_RU_PATCH}"; then
-    log "Step 0: New DB home already patched at target level — Phase 2 complete."
-    log "  Found: $(echo "${EXISTING_PATCHES}" | grep "${DB_APPLY_RU_PATCH}")"
-    log "=== PHASE 2 COMPLETE (already done — skipped) ==="
-    mark_phase_complete 2
-    exit 0
+    log "Step 0: New DB home already patched at target level (found $(echo "${EXISTING_PATCHES}" | grep "${DB_APPLY_RU_PATCH}" | head -1))."
+    log "Step 0: Skipping Steps 1-7, resuming at Step 8."
+    FROM_STEP=8
   else
     log "Step 0: New DB home exists but is NOT at target patch level."
     log "  Current patches: ${EXISTING_PATCHES}"
@@ -41,6 +44,9 @@ if [[ -f "${NEW_DB_HOME}/OPatch/opatch" ]]; then
     exit 1
   fi
 fi
+log "Starting at Step ${FROM_STEP}."
+
+if (( FROM_STEP <= 7 )); then
 log "Step 0: New DB home does not exist yet — proceeding with Phase 2."
 log "Step 1: Checking required zip files..."
 for f in \
@@ -128,6 +134,10 @@ log "  -responseFile: ${DB_RSP_TMP}"
 # after runInstaller, skipping Steps 8 and 9 (AutoUpgrade JAR and analyze).
 # Fix: capture the exit code explicitly and check the installer log for the
 # "Successfully Setup Software" string to distinguish warnings from failures.
+# runInstaller exit codes: 0 = success, 6 = success with warnings (e.g. [INS-13014]
+# optional prerequisites not met), anything else = failure. Capture the code
+# explicitly so set -e does not kill the script on 6.
+set +e
 "${NEW_DB_HOME}/runInstaller" \
   -silent \
   -ignorePrereqFailure \
@@ -135,23 +145,24 @@ log "  -responseFile: ${DB_RSP_TMP}"
   -applyRU "${DB_APPLY_RU_PATH}" \
   -applyOneOffs "${DB_ONEOFF_PATHS_FULL}" \
   -responseFile "${DB_RSP_TMP}" \
-  ORACLE_HOME="${NEW_DB_HOME}" || {
-    RI_RC=$?
-    RI_LOG=$(ls -t /u01/app/oraInventory/logs/InstallActions*/installActions*.log \
-      2>/dev/null | head -1 || true)
-    if grep -q "Successfully Setup Software" "${RI_LOG}" 2>/dev/null; then
-      log "  Step 7: runInstaller completed with warnings (exit code ${RI_RC}) — continuing."
-      log "  [INS-13014] optional prerequisite warnings are expected and harmless."
-      log "  Install log: ${RI_LOG}"
-    else
-      log "ERROR: Step 7: runInstaller FAILED with exit code ${RI_RC}."
-      log "  Install log: ${RI_LOG:-not found}"
-      log "  Review log for details before retrying."
-      exit 1
-    fi
-  }
+  ORACLE_HOME="${NEW_DB_HOME}"
+RI_RC=$?
+set -e
+RI_LOG=$(ls -t /u01/app/oraInventory/logs/InstallActions*/installActions*.log \
+  2>/dev/null | head -1 || true)
+case "${RI_RC}" in
+  0) ;;
+  6) log "  Step 7: runInstaller finished with warnings (exit code 6) -- continuing."
+     log "  [INS-13014] optional prerequisite warnings are expected and harmless."
+     log "  Install log: ${RI_LOG:-not found}" ;;
+  *) log "ERROR: Step 7: runInstaller FAILED with exit code ${RI_RC}."
+     log "  Install log: ${RI_LOG:-not found}"
+     exit 1 ;;
+esac
 
 log "Step 7: runInstaller completed successfully."
+fi
+
 
 # -- 8. Stage AutoUpgrade JAR -------------------------------------------------
 # Hard failure -- AutoUpgrade is required for the deploy phase (phase3).
