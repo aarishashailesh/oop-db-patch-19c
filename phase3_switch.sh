@@ -3,6 +3,9 @@
 # phase3_switch.sh — Grid and Database Home Switch (CRS_CONFIG)
 # Run as: root
 # Uses su - to switch to grid/oracle users (no sudoers required)
+#
+# Step 0a disables SYS.DB_DDL_ALERT_TRG (db/cdb/pdb) before the outage and
+# AutoUpgrade; phase4 enables it again after patching.
 # =============================================================================
 set -euo pipefail
 umask 0022
@@ -15,8 +18,69 @@ exec >> "${LOG_DIR}/phase3_switch.log" 2>&1
 
 log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 die()  { log "CRITICAL ERROR: $*"; exit 1; }
-rungrid()   { su - "${GRID_USER}"   -c "$1"; }
-runoracle() { su - "${ORACLE_USER}" -c "$1"; }
+rungrid()   { su - "${GRID_USER}"   -c "unset LD_LIBRARY_PATH; $1"; }
+runoracle() { su - "${ORACLE_USER}" -c "unset LD_LIBRARY_PATH; $1"; }
+
+# ── SYS.DB_DDL_ALERT_TRG: disabled before the outage (phase 3), enabled after patching (phase 4)
+# Works for a non-CDB, or a CDB (root plus every READ WRITE PDB). Containers where the
+# trigger does not exist are skipped. Returns non-zero if sqlplus fails.
+ddl_trigger() {   # usage: ddl_trigger DISABLE|ENABLE <oracle_home> <oracle_sid>
+  local action="$1" home="$2" sid="$3" rc=0
+  local sqlf out
+  sqlf=$(mktemp /tmp/ddl_trg_XXXXXX.sql)
+  out=$(mktemp /tmp/ddl_trg_XXXXXX.out)
+  cat > "${sqlf}" << 'SQLEOF'
+SET SERVEROUTPUT ON SIZE UNLIMITED FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+WHENEVER SQLERROR EXIT FAILURE
+DECLARE
+  TYPE t_names IS TABLE OF VARCHAR2(128);
+  v_names   t_names := t_names();
+  v_skipped t_names := t_names();
+  v_cdb     VARCHAR2(3);
+  PROCEDURE do_trg(p_label IN VARCHAR2) IS
+    v_cnt PLS_INTEGER;
+  BEGIN
+    EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM dba_triggers WHERE owner = ''SYS'' AND trigger_name = ''DB_DDL_ALERT_TRG''' INTO v_cnt;
+    IF v_cnt = 0 THEN
+      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || p_label || ': trigger not present, skipped');
+    ELSE
+      EXECUTE IMMEDIATE 'ALTER TRIGGER SYS.DB_DDL_ALERT_TRG __ACTION__';
+      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || p_label || ': __ACTION__ done');
+    END IF;
+  END do_trg;
+BEGIN
+  EXECUTE IMMEDIATE 'SELECT cdb FROM v$database' INTO v_cdb;
+  do_trg(CASE WHEN v_cdb = 'YES' THEN 'CDB$ROOT' ELSE 'non-CDB' END);
+  IF v_cdb = 'YES' THEN
+    EXECUTE IMMEDIATE q'[SELECT name FROM v$pdbs WHERE name <> 'PDB$SEED' AND open_mode = 'READ WRITE' ORDER BY con_id]'
+      BULK COLLECT INTO v_names;
+    EXECUTE IMMEDIATE q'[SELECT name FROM v$pdbs WHERE name <> 'PDB$SEED' AND open_mode <> 'READ WRITE' ORDER BY con_id]'
+      BULK COLLECT INTO v_skipped;
+    FOR i IN 1 .. v_names.COUNT LOOP
+      EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = ' || DBMS_ASSERT.ENQUOTE_NAME(v_names(i), FALSE);
+      do_trg(v_names(i));
+    END LOOP;
+    EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = CDB$ROOT';
+    FOR i IN 1 .. v_skipped.COUNT LOOP
+      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG WARNING: PDB ' || v_skipped(i) || ' is not READ WRITE, skipped');
+    END LOOP;
+  END IF;
+END;
+/
+EXIT
+SQLEOF
+  sed -i "s/__ACTION__/${action}/g" "${sqlf}"
+  chmod 644 "${sqlf}"
+  runoracle "
+    export ORACLE_HOME=${home}
+    export ORACLE_SID=${sid}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @${sqlf}
+  " > "${out}" 2>&1 || rc=$?
+  while IFS= read -r l; do log "  ${l}"; done < "${out}"
+  rm -f "${sqlf}" "${out}"
+  return "${rc}"
+}
 
 log "=== PHASE 3: Grid and Database Home Switch ==="
 
@@ -47,6 +111,21 @@ if [[ "${OCSSD_HOME}" == "${NEW_GRID_HOME}" ]]; then
 fi
 
 if [[ "${GI_SWITCH_DONE}" != "true" ]]; then
+
+# ── Step 0a: Disable SYS.DB_DDL_ALERT_TRG before the outage and AutoUpgrade ────
+# The database is still up from the old home here. Phase 4 enables the trigger again.
+log "Step 0a: Disabling SYS.DB_DDL_ALERT_TRG (non-CDB, or CDB root and open PDBs)..."
+TRG_DB="${DB_NAME}"
+if [[ -z "${TRG_DB}" ]]; then
+  TRG_DB=$(rungrid "export ORACLE_HOME=${OLD_GRID_HOME}; export PATH=\${ORACLE_HOME}/bin:\${PATH}; srvctl list database 2>/dev/null | head -1" || true)
+fi
+[[ -z "${TRG_DB}" ]] && die "Could not determine the database name to disable SYS.DB_DDL_ALERT_TRG."
+TRG_SID=$(rungrid "export ORACLE_HOME=${OLD_GRID_HOME}; export PATH=\${ORACLE_HOME}/bin:\${PATH}; srvctl status database -d ${TRG_DB} 2>/dev/null | grep -i \$(hostname -s) | awk '{print \$2}' | head -1" 2>/dev/null || true)
+TRG_SID="${TRG_SID:-${TRG_DB}}"
+log "  Database: ${TRG_DB}   Instance: ${TRG_SID}   Home: ${OLD_DB_HOME}"
+ddl_trigger DISABLE "${OLD_DB_HOME}" "${TRG_SID}" \
+  || die "Could not disable SYS.DB_DDL_ALERT_TRG (is the database open?). Nothing has been stopped yet; fix and re-run phase 3."
+
 # The listener must be stopped before switchGridHome.
 # NOTE: Do NOT shut down the database here. AutoUpgrade deploy mode handles
 # the database shutdown and restart internally as part of its deploy workflow.
@@ -62,7 +141,7 @@ rungrid "
   export ORACLE_HOME=${OLD_GRID_HOME}
   export PATH=\${ORACLE_HOME}/bin:/usr/local/bin:/usr/bin:/bin
   echo 'Stopping listener...'
-  \${ORACLE_HOME}/bin/srvctl stop listener -l LISTENER
+  \${ORACLE_HOME}/bin/srvctl stop listener -l LISTENER || echo 'stop listener returned non-zero (already stopped?) -- continuing'
   echo 'Verifying listener stopped:'
   \${ORACLE_HOME}/bin/srvctl status listener
 "
@@ -83,6 +162,11 @@ SWITCH_RSP="/tmp/switch_grid_$(date +%Y%m%d%H%M%S)_$$.rsp"
 trap 'rm -f "${SWITCH_RSP}"' EXIT
 
 cp "${GRID_RSP}" "${SWITCH_RSP}"
+# The file is created by root but read by gridSetup.sh running as ${GRID_USER}.
+# cp keeps the template's mode (often 600), which causes "(Permission denied)".
+# It may contain passwords, so hand it to the Grid owner and keep it private.
+chown "${GRID_USER}:${INSTALL_GROUP}" "${SWITCH_RSP}"
+chmod 600 "${SWITCH_RSP}"
 sed -i "s|^oracle.install.asm.OSDBA=.*|oracle.install.asm.OSDBA=${GI_OSDBA_GROUP}|g" \
   "${SWITCH_RSP}"
 sed -i "s|^oracle.install.asm.OSOPER=.*|oracle.install.asm.OSOPER=${GI_OSOPER_GROUP}|g" \
@@ -94,10 +178,14 @@ sed -i "s|^oracle.install.option=.*|oracle.install.option=CRS_SWONLY|g" \
 
 log "  switchGridHome response file: ${SWITCH_RSP}"
 grep -E "^oracle.install.asm\.|^oracle.install.option" "${SWITCH_RSP}" | \
-  grep -v "^#" | while IFS= read -r line; do log "  ${line}"; done
+  grep -vi "^#\|password" | while IFS= read -r line; do log "  ${line}"; done
 
 # ── Step 2: gridSetup.sh -switchGridHome (as grid) ───────────────────────────
 log "Step 2: gridSetup.sh -switchGridHome (as ${GRID_USER})..."
+# gridSetup.sh exit codes: 0 = success, 6 = success with optional prerequisite
+# warnings, anything else = failure. Capture the code so set -e does not abort
+# on 6 (same handling as phase1 and phase2).
+set +e
 rungrid "
   export ORACLE_HOME=${NEW_GRID_HOME}
   export CV_ASSUME_DISTID=${CV_ASSUME_DISTID}
@@ -107,6 +195,15 @@ rungrid "
     -switchGridHome \
     -responseFile ${SWITCH_RSP}
 "
+SG_RC=$?
+set -e
+case "${SG_RC}" in
+  0) ;;
+  6) log "  Step 2: gridSetup.sh finished with warnings (exit code 6) -- continuing." ;;
+  *) log "ERROR: Step 2: gridSetup.sh -switchGridHome FAILED with exit code ${SG_RC}."
+     log "  Check the newest log under /u01/app/oraInventory/logs/GridSetupActions*/"
+     exit 1 ;;
+esac
 log "gridSetup.sh -switchGridHome complete."
 
 # Verify inventory shows new home with CRS=true
@@ -284,6 +381,30 @@ ORACLE_HOME_DIR=$(eval echo ~${ORACLE_USER})
 if ! grep -q "ADR_BASE" "${ORACLE_HOME_DIR}/.bash_profile" 2>/dev/null; then
   echo "export ADR_BASE=${ORACLE_BASE}" >> "${ORACLE_HOME_DIR}/.bash_profile"
   log "  Added ADR_BASE to ${ORACLE_HOME_DIR}/.bash_profile"
+fi
+
+# ── Step 9: Verify CRS registration, oratab and olr.loc ──────────────────────
+# The CRS agent maintains /etc/oratab for CRS-managed databases and oraenv
+# resolves +ASM from /etc/oracle/olr.loc, so nothing is edited here: just
+# verify and warn. Fix manually only if a WARNING appears.
+log "Step 9: Verifying CRS registration and /etc/oratab..."
+CRS_DB_HOME=$(runoracle "
+  ${NEW_GRID_HOME}/bin/srvctl config database -d ${DB_NAME} 2>/dev/null \
+    | awk -F': ' '/^Oracle home/ {print \$2}'
+" || true)
+log "  CRS Oracle home for ${DB_NAME}: ${CRS_DB_HOME:-unknown}"
+if [[ "${CRS_DB_HOME}" != "${NEW_DB_HOME}" ]]; then
+  log "  WARNING: CRS does not show ${NEW_DB_HOME} as the home of ${DB_NAME}."
+fi
+log "  /etc/oratab entries:"
+{ grep -v '^#' /etc/oratab 2>/dev/null | grep -v '^$' || true; } | while IFS= read -r line; do log "    ${line}"; done
+if grep -v '^#' /etc/oratab 2>/dev/null | grep -qF "${OLD_DB_HOME}"; then
+  log "  WARNING: /etc/oratab still references ${OLD_DB_HOME}."
+fi
+OLR_HOME=$(grep -i '^crs_home=' /etc/oracle/olr.loc 2>/dev/null | cut -d= -f2 || true)
+log "  olr.loc crs_home: ${OLR_HOME:-unknown}"
+if [[ -n "${OLR_HOME}" && "${OLR_HOME}" != "${NEW_GRID_HOME}" ]]; then
+  log "  WARNING: olr.loc crs_home is not ${NEW_GRID_HOME}."
 fi
 
 mark_phase_complete 3

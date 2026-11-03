@@ -21,7 +21,7 @@
 #   2  phase2_db_prep.sh      Build and patch new DB home        (online)
 #   3  phase3_switch.sh       Home switch + AutoUpgrade deploy   (OUTAGE)
 #   4  phase4_post_install.sh Post-patch validation + utlrp      (online)
-#   5  phase5_cleanup.sh      Deinstall old homes                (manual)
+#   5  phase5_cleanup.sh      Detach + remove old homes          (manual)
 #   6  phase6_security.sh     FIPS 140 + extproc disable         (manual)
 #   7  phase7_aide.sh         AIDE integrity DB reset            (manual)
 # =============================================================================
@@ -139,6 +139,12 @@ log "==========================================================="
 for var in NEW_PATCH_LEVEL OLD_PATCH_LEVEL RU_COMBO_PATCH GI_RU_PATCH \
            GI_APPLY_RU_PATCH GI_ONEOFF_PATCHES DB_APPLY_RU_PATCH; do
   [[ -z "${!var:-}" ]] && die "patch.conf variable '${var}' is not set."
+done
+
+# Home paths must not end with "/" (sed replacements in phases 1 and 3 and the
+# olr.loc comparison in phase 3 would silently miss).
+for var in OLD_GRID_HOME NEW_GRID_HOME OLD_DB_HOME NEW_DB_HOME; do
+  [[ "${!var}" == */ ]] && die "patch.conf: ${var}='${!var}' has a trailing slash. Remove it."
 done
 
 # Verify PATCH_LOC exists and is accessible
@@ -312,7 +318,7 @@ if (( START_PHASE <= 5 && END_PHASE >= 5 )); then
   log "Only proceed if Phase 4 validation is fully confirmed."
   log "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
   run_phase 5 "phase5_cleanup.sh" \
-    "Deinstall old homes ${OLD_GRID_HOME} and ${OLD_DB_HOME}" \
+    "Detach (runInstaller -detachHome) and remove old homes ${OLD_GRID_HOME} and ${OLD_DB_HOME}" \
     "root"
 fi
 

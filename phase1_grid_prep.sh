@@ -143,10 +143,12 @@ log "  -applyRU     : ${GI_APPLY_RU_PATH}"
 log "  -applyOneOffs: ${GI_ONEOFF_PATHS}"
 log "  -responseFile: ${GRID_RSP_TMP}"
 
-# gridSetup.sh exits non-zero for optional prerequisite warnings (e.g. INS-13014)
-# even when all patches are applied successfully. With set -euo pipefail this
-# kills the script before Steps 9-11 run. Fix: capture exit code and check
-# the installer log for actual success/failure.
+# gridSetup.sh exit codes: 0 = success, 6 = success with optional prerequisite
+# warnings (e.g. [INS-13014]), anything else = failure. Capture the code
+# explicitly so set -e does not kill the script on 6 (same handling as
+# phase2 runInstaller). For any other non-zero code, fall back to the installer
+# logs: continue only if they show the software was actually set up.
+set +e
 "${NEW_GRID_HOME}/gridSetup.sh" \
   -silent \
   -ignorePrereqFailure \
@@ -154,25 +156,31 @@ log "  -responseFile: ${GRID_RSP_TMP}"
   -applyRU "${GI_APPLY_RU_PATH}" \
   -applyOneOffs "${GI_ONEOFF_PATHS}" \
   -responseFile "${GRID_RSP_TMP}" \
-  oracle.install.option=CRS_SWONLY || {
-    GS_RC=$?
-    GS_LOG=$(ls -t /u01/app/oraInventory/logs/GridSetupActions*/installerPatchActions*.log \
-      2>/dev/null | head -1 || true)
-    GS_MAIN=$(ls -t /u01/app/oraInventory/logs/GridSetupActions*/installActions*.log \
-      2>/dev/null | head -1 || true)
-    if grep -qE "Successfully applied the patch|Successfully Setup Software" \
-        "${GS_LOG}" 2>/dev/null || \
-       grep -q "Successfully Setup Software" "${GS_MAIN}" 2>/dev/null; then
-      log "  Step 8: gridSetup.sh exited with code ${GS_RC} -- patches applied successfully."
-      log "  Optional prerequisite warnings are expected and harmless."
-      log "  Patch log: ${GS_LOG:-not found}"
-    else
-      log "ERROR: Step 8: gridSetup.sh FAILED with exit code ${GS_RC}."
-      log "  Patch log : ${GS_LOG:-not found}"
-      log "  Install log: ${GS_MAIN:-not found}"
-      exit 1
-    fi
-  }
+  oracle.install.option=CRS_SWONLY
+GS_RC=$?
+set -e
+GS_LOG=$(ls -t /u01/app/oraInventory/logs/GridSetupActions*/installerPatchActions*.log \
+  2>/dev/null | head -1 || true)
+GS_MAIN=$(ls -t /u01/app/oraInventory/logs/GridSetupActions*/installActions*.log \
+  2>/dev/null | head -1 || true)
+case "${GS_RC}" in
+  0) ;;
+  6) log "  Step 8: gridSetup.sh finished with warnings (exit code 6) -- continuing."
+     log "  [INS-13014] optional prerequisite warnings are expected and harmless."
+     log "  Patch log  : ${GS_LOG:-not found}"
+     log "  Install log: ${GS_MAIN:-not found}" ;;
+  *) if grep -qE "Successfully applied the patch|Successfully Setup Software" \
+         "${GS_LOG}" 2>/dev/null || \
+        grep -q "Successfully Setup Software" "${GS_MAIN}" 2>/dev/null; then
+       log "  Step 8: gridSetup.sh exited with code ${GS_RC} but the logs show success -- continuing."
+       log "  Patch log: ${GS_LOG:-not found}"
+     else
+       log "ERROR: Step 8: gridSetup.sh FAILED with exit code ${GS_RC}."
+       log "  Patch log  : ${GS_LOG:-not found}"
+       log "  Install log: ${GS_MAIN:-not found}"
+       exit 1
+     fi ;;
+esac
 
 log "Step 8: gridSetup.sh completed."
 

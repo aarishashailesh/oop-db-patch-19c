@@ -9,7 +9,7 @@
 #   C. Restart database
 #   D. Run internal validations (XOQ_VALIDATE, APS_VALIDATE) and utlrp
 #   E. Verify v$option shows FALSE for disabled options
-#   F. Verify DBA_REGISTRY — all components VALID or OPTION OFF
+#   F. Enable SYS.DB_DDL_ALERT_TRG again (disabled in phase 3)
 #   G. Verify Grid patch level and resource status
 # =============================================================================
 set -euo pipefail
@@ -25,15 +25,79 @@ exec >> "${LOG_DIR}/phase4_post_install.log" 2>&1
 log()    { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 die()    { log "CRITICAL ERROR: $*"; exit 1; }
 
+runoracle_p4() { su - "${ORACLE_USER}" -c "unset LD_LIBRARY_PATH; $1"; }
+
 runsql() {
   # runsql <instance_sid> <oracle_home> <sql_file>
   local sid="$1" home="$2" sqlfile="$3"
-  su - "${ORACLE_USER}" -c "
+  su - "${ORACLE_USER}" -c "unset LD_LIBRARY_PATH
     export ORACLE_HOME=${home}
     export ORACLE_SID=${sid}
     export PATH=\${ORACLE_HOME}/bin:\${PATH}
     \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @${sqlfile}
   "
+}
+
+
+# ── SYS.DB_DDL_ALERT_TRG: disabled before the outage (phase 3), enabled after patching (phase 4)
+# Works for a non-CDB, or a CDB (root plus every READ WRITE PDB). Containers where the
+# trigger does not exist are skipped. Returns non-zero if sqlplus fails.
+ddl_trigger() {   # usage: ddl_trigger DISABLE|ENABLE <oracle_home> <oracle_sid>
+  local action="$1" home="$2" sid="$3" rc=0
+  local sqlf out
+  sqlf=$(mktemp /tmp/ddl_trg_XXXXXX.sql)
+  out=$(mktemp /tmp/ddl_trg_XXXXXX.out)
+  cat > "${sqlf}" << 'SQLEOF'
+SET SERVEROUTPUT ON SIZE UNLIMITED FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+WHENEVER SQLERROR EXIT FAILURE
+DECLARE
+  TYPE t_names IS TABLE OF VARCHAR2(128);
+  v_names   t_names := t_names();
+  v_skipped t_names := t_names();
+  v_cdb     VARCHAR2(3);
+  PROCEDURE do_trg(p_label IN VARCHAR2) IS
+    v_cnt PLS_INTEGER;
+  BEGIN
+    EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM dba_triggers WHERE owner = ''SYS'' AND trigger_name = ''DB_DDL_ALERT_TRG''' INTO v_cnt;
+    IF v_cnt = 0 THEN
+      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || p_label || ': trigger not present, skipped');
+    ELSE
+      EXECUTE IMMEDIATE 'ALTER TRIGGER SYS.DB_DDL_ALERT_TRG __ACTION__';
+      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || p_label || ': __ACTION__ done');
+    END IF;
+  END do_trg;
+BEGIN
+  EXECUTE IMMEDIATE 'SELECT cdb FROM v$database' INTO v_cdb;
+  do_trg(CASE WHEN v_cdb = 'YES' THEN 'CDB$ROOT' ELSE 'non-CDB' END);
+  IF v_cdb = 'YES' THEN
+    EXECUTE IMMEDIATE q'[SELECT name FROM v$pdbs WHERE name <> 'PDB$SEED' AND open_mode = 'READ WRITE' ORDER BY con_id]'
+      BULK COLLECT INTO v_names;
+    EXECUTE IMMEDIATE q'[SELECT name FROM v$pdbs WHERE name <> 'PDB$SEED' AND open_mode <> 'READ WRITE' ORDER BY con_id]'
+      BULK COLLECT INTO v_skipped;
+    FOR i IN 1 .. v_names.COUNT LOOP
+      EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = ' || DBMS_ASSERT.ENQUOTE_NAME(v_names(i), FALSE);
+      do_trg(v_names(i));
+    END LOOP;
+    EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = CDB$ROOT';
+    FOR i IN 1 .. v_skipped.COUNT LOOP
+      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG WARNING: PDB ' || v_skipped(i) || ' is not READ WRITE, skipped');
+    END LOOP;
+  END IF;
+END;
+/
+EXIT
+SQLEOF
+  sed -i "s/__ACTION__/${action}/g" "${sqlf}"
+  chmod 644 "${sqlf}"
+  runoracle_p4 "
+    export ORACLE_HOME=${home}
+    export ORACLE_SID=${sid}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @${sqlf}
+  " > "${out}" 2>&1 || rc=$?
+  while IFS= read -r l; do log "  ${l}"; done < "${out}"
+  rm -f "${sqlf}" "${out}"
+  return "${rc}"
 }
 
 log "=== PHASE 4: Post-Installation Tasks ==="
@@ -46,7 +110,7 @@ log "New Grid Home: ${NEW_GRID_HOME}"
 # ── Detect DB name and instance SID ──────────────────────────────────────────
 [[ -z "${DB_NAME}" ]] && die "DB_NAME not set in patch.conf"
 
-DB_INSTANCE=$(su - "${ORACLE_USER}" -c "
+DB_INSTANCE=$(su - "${ORACLE_USER}" -c "unset LD_LIBRARY_PATH
   export ORACLE_HOME=${NEW_GRID_HOME}
   export PATH=\${ORACLE_HOME}/bin:\${PATH}
   \${ORACLE_HOME}/bin/srvctl status database -d ${DB_NAME} 2>/dev/null \
@@ -81,7 +145,7 @@ runsql "${DB_INSTANCE}" "${NEW_DB_HOME}" /tmp/phase4_pre_invalids.sql \
 log "Step B: Disabling unused Oracle options via chopt..."
 log "  Options to disable: olap, rat (Real Application Testing), partitioning"
 
-su - "${ORACLE_USER}" -c "
+su - "${ORACLE_USER}" -c "unset LD_LIBRARY_PATH
   export ORACLE_HOME=${NEW_DB_HOME}
   export PATH=\${ORACLE_HOME}/bin:\${PATH}
   cd \${ORACLE_HOME}/bin
@@ -99,7 +163,7 @@ log "chopt disable complete."
 
 # ── Step C: Restart database ────────────────────────────────────────────────────
 log "Step C: Restarting database ${DB_NAME} to apply chopt changes..."
-su - "${ORACLE_USER}" -c "
+su - "${ORACLE_USER}" -c "unset LD_LIBRARY_PATH
   export ORACLE_HOME=${NEW_DB_HOME}
   export PATH=\${ORACLE_HOME}/bin:\${PATH}
   ${NEW_GRID_HOME}/bin/srvctl stop  database -d ${DB_NAME}
@@ -164,6 +228,11 @@ EXIT;
 SQLEOF
 runsql "${DB_INSTANCE}" "${NEW_DB_HOME}" /tmp/phase4_voption.sql \
   | tee "${LOG_DIR}/phase4_validation.log"
+
+# ── Step F: Enable SYS.DB_DDL_ALERT_TRG again (disabled in phase 3) ───────────
+log "Step F: Enabling SYS.DB_DDL_ALERT_TRG (non-CDB, or CDB root and open PDBs)..."
+ddl_trigger ENABLE "${NEW_DB_HOME}" "${DB_INSTANCE}" \
+  || die "Could not enable SYS.DB_DDL_ALERT_TRG. Run: alter trigger SYS.DB_DDL_ALERT_TRG enable;  in the root and each PDB, then re-run phase 4."
 
 # ── Step G: Verify Grid patch level ────────────────────────────────────────────
 log "Step G: Verifying Grid patch level and resource status..."
