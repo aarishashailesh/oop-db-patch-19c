@@ -219,8 +219,11 @@ Phase order is enforced by markers in `.phase_status`.
 7. **`systemd-run`** instructions for every phase, without `--working-directory`.
 8. **Phase 3 Step 9** verifies the CRS database home, `/etc/oratab` and `olr.loc` (read-only, warnings only).
 9. Every `su -` call starts with `unset LD_LIBRARY_PATH` so a profile that exports a Grid library path cannot leak into the installers.
+10. **OLAP validation in every container.** Phase 4 Step D runs `XOQ_VALIDATE` and `APS_VALIDATE` after `chopt disable olap`: with `catcon.pl` in CDB$ROOT, PDB$SEED and all PDBs on a CDB (otherwise the next AutoUpgrade analyze fails with `Database option APS/XOQ mismatch`), directly on a non-CDB. `chopt disable partitioning` is skipped on a CDB.
 
 ## SYS.DB_DDL_ALERT_TRG
+
+On a CDB the trigger statement is run with `catcon.pl` in CDB$ROOT and every open PDB (PDB$SEED excluded). The trigger is local to each container, so it must exist in each one; create it in every container the same way before the first cycle.
 
 - **Phase 3, Step 0a** (before the listener is stopped and before AutoUpgrade): `alter trigger SYS.DB_DDL_ALERT_TRG disable` in a non-CDB, or in the CDB root and every READ WRITE PDB. The database must be open. If the trigger cannot be disabled, Phase 3 stops before anything is shut down. It runs as `oracle` from the old DB home.
 - **Phase 4, Step F:** the same with `enable`, from the new DB home. If it fails, Phase 4 stops (no success marker), so Phase 5 cannot run until the trigger is enabled.

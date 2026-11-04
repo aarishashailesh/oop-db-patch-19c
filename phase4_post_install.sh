@@ -43,60 +43,73 @@ runsql() {
 # Works for a non-CDB, or a CDB (root plus every READ WRITE PDB). Containers where the
 # trigger does not exist are skipped. Returns non-zero if sqlplus fails.
 ddl_trigger() {   # usage: ddl_trigger DISABLE|ENABLE <oracle_home> <oracle_sid>
-  local action="$1" home="$2" sid="$3" rc=0
-  local sqlf out
-  sqlf=$(mktemp /tmp/ddl_trg_XXXXXX.sql)
+  local action="$1" home="$2" sid="$3" rc=0 tag
+  tag=$(mktemp -u XXXXXX)
+  local info="/tmp/ddl_trg_${tag}_info.sql" body="/tmp/ddl_trg_${tag}_body.sql" one="/tmp/ddl_trg_${tag}_one.sql"
+  local out logd
   out=$(mktemp /tmp/ddl_trg_XXXXXX.out)
-  cat > "${sqlf}" << 'SQLEOF'
-SET SERVEROUTPUT ON SIZE UNLIMITED FEEDBACK OFF PAGESIZE 0 LINESIZE 200
-WHENEVER SQLERROR EXIT FAILURE
+  # Statement run in every container (non-CDB: once). Containers without the trigger are skipped.
+  cat > "${body}" << 'SQLEOF'
+SET SERVEROUTPUT ON
 DECLARE
-  TYPE t_names IS TABLE OF VARCHAR2(128);
-  v_names   t_names := t_names();
-  v_skipped t_names := t_names();
-  v_cdb     VARCHAR2(3);
-  PROCEDURE do_trg(p_label IN VARCHAR2) IS
-    v_cnt PLS_INTEGER;
-  BEGIN
-    EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM dba_triggers WHERE owner = ''SYS'' AND trigger_name = ''DB_DDL_ALERT_TRG''' INTO v_cnt;
-    IF v_cnt = 0 THEN
-      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || p_label || ': trigger not present, skipped');
-    ELSE
-      EXECUTE IMMEDIATE 'ALTER TRIGGER SYS.DB_DDL_ALERT_TRG __ACTION__';
-      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || p_label || ': __ACTION__ done');
-    END IF;
-  END do_trg;
+  v_cnt PLS_INTEGER;
 BEGIN
-  EXECUTE IMMEDIATE 'SELECT cdb FROM v$database' INTO v_cdb;
-  do_trg(CASE WHEN v_cdb = 'YES' THEN 'CDB$ROOT' ELSE 'non-CDB' END);
-  IF v_cdb = 'YES' THEN
-    EXECUTE IMMEDIATE q'[SELECT name FROM v$pdbs WHERE name <> 'PDB$SEED' AND open_mode = 'READ WRITE' ORDER BY con_id]'
-      BULK COLLECT INTO v_names;
-    EXECUTE IMMEDIATE q'[SELECT name FROM v$pdbs WHERE name <> 'PDB$SEED' AND open_mode <> 'READ WRITE' ORDER BY con_id]'
-      BULK COLLECT INTO v_skipped;
-    FOR i IN 1 .. v_names.COUNT LOOP
-      EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = ' || DBMS_ASSERT.ENQUOTE_NAME(v_names(i), FALSE);
-      do_trg(v_names(i));
-    END LOOP;
-    EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = CDB$ROOT';
-    FOR i IN 1 .. v_skipped.COUNT LOOP
-      DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG WARNING: PDB ' || v_skipped(i) || ' is not READ WRITE, skipped');
-    END LOOP;
+  SELECT COUNT(*) INTO v_cnt FROM dba_triggers WHERE owner = 'SYS' AND trigger_name = 'DB_DDL_ALERT_TRG';
+  IF v_cnt = 0 THEN
+    DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || SYS_CONTEXT('USERENV','CON_NAME') || ': trigger not present, skipped');
+  ELSE
+    EXECUTE IMMEDIATE 'ALTER TRIGGER SYS.DB_DDL_ALERT_TRG __ACTION__';
+    DBMS_OUTPUT.PUT_LINE('DB_DDL_ALERT_TRG ' || SYS_CONTEXT('USERENV','CON_NAME') || ': __ACTION__ done');
   END IF;
 END;
 /
+SQLEOF
+  sed -i "s/__ACTION__/${action}/g" "${body}"
+  # Is it a CDB, and are any PDBs not open READ WRITE (catcon only reaches open containers)?
+  cat > "${info}" << 'SQLEOF'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT 'CDB=' || cdb FROM v$database;
+SELECT 'NOTRW=' || name || ' (' || open_mode || ')' FROM v$pdbs WHERE name <> 'PDB$SEED' AND open_mode <> 'READ WRITE';
 EXIT
 SQLEOF
-  sed -i "s/__ACTION__/${action}/g" "${sqlf}"
-  chmod 644 "${sqlf}"
+  { echo "WHENEVER SQLERROR EXIT FAILURE"; cat "${body}"; echo "EXIT"; } > "${one}"
+  chmod 644 "${body}" "${info}" "${one}"
   runoracle_p4 "
     export ORACLE_HOME=${home}
     export ORACLE_SID=${sid}
     export PATH=\${ORACLE_HOME}/bin:\${PATH}
-    \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @${sqlf}
+    \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @${info}
   " > "${out}" 2>&1 || rc=$?
-  while IFS= read -r l; do log "  ${l}"; done < "${out}"
-  rm -f "${sqlf}" "${out}"
+  if (( rc == 0 )) && grep -q '^CDB=YES' "${out}"; then
+    grep '^NOTRW=' "${out}" | while IFS= read -r l; do log "  WARNING: PDB ${l#NOTRW=} is not READ WRITE, trigger left unchanged there"; done
+    logd=$(mktemp -d /tmp/ddl_trg_logs_XXXXXX); chmod 777 "${logd}"
+    log "  CDB: ${action} in CDB\$ROOT and all open PDBs (catcon.pl, PDB\$SEED excluded)"
+    runoracle_p4 "
+      export ORACLE_HOME=${home}
+      export ORACLE_SID=${sid}
+      export PATH=\${ORACLE_HOME}/bin:\${PATH}
+      \${ORACLE_HOME}/perl/bin/perl \${ORACLE_HOME}/rdbms/admin/catcon.pl -d /tmp -l ${logd} -b ddl_trg -C 'PDB\$SEED' $(basename "${body}")
+    " > "${out}" 2>&1 || rc=$?
+    { grep -h 'DB_DDL_ALERT_TRG' "${logd}"/*.log 2>/dev/null || true; } | sort -u | while IFS= read -r l; do log "  ${l}"; done
+    if grep -lE 'ORA-[0-9]+|SP2-[0-9]+' "${logd}"/*.log >/dev/null 2>&1; then
+      log "  ERROR: errors in catcon logs:"
+      { grep -hE 'ORA-[0-9]+|SP2-[0-9]+' "${logd}"/*.log || true; } | sort -u | while IFS= read -r l; do log "    ${l}"; done
+      rc=1
+    fi
+    [[ -z "$(ls "${logd}"/*.log 2>/dev/null)" ]] && { log "  ERROR: catcon produced no logs (see output below)"; cat "${out}" | while IFS= read -r l; do log "    ${l}"; done; rc=1; }
+    rm -rf "${logd}"
+  elif (( rc == 0 )); then
+    runoracle_p4 "
+      export ORACLE_HOME=${home}
+      export ORACLE_SID=${sid}
+      export PATH=\${ORACLE_HOME}/bin:\${PATH}
+      \${ORACLE_HOME}/bin/sqlplus -s / as sysdba @${one}
+    " > "${out}" 2>&1 || rc=$?
+    while IFS= read -r l; do log "  ${l}"; done < "${out}"
+  else
+    while IFS= read -r l; do log "  ${l}"; done < "${out}"
+  fi
+  rm -f "${info}" "${body}" "${one}" "${out}"
   return "${rc}"
 }
 
@@ -143,7 +156,22 @@ runsql "${DB_INSTANCE}" "${NEW_DB_HOME}" /tmp/phase4_pre_invalids.sql \
 
 # ── Step B: Disable unused DB options via chopt ───────────────────────────────
 log "Step B: Disabling unused Oracle options via chopt..."
-log "  Options to disable: olap, rat (Real Application Testing), partitioning"
+
+# Partitioning must NOT be disabled in a CDB (non-CDB only), so detect it first.
+cat > /tmp/phase4_iscdb.sql << 'SQLEOF'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT cdb FROM v$database;
+EXIT;
+SQLEOF
+IS_CDB=$(runsql "${DB_INSTANCE}" "${NEW_DB_HOME}" /tmp/phase4_iscdb.sql 2>/dev/null | tr -d '[:space:]' || true)
+log "  CDB: ${IS_CDB:-unknown}"
+if [[ "${IS_CDB}" == "YES" ]]; then
+  CHOPT_PART="echo 'CDB: skipping chopt disable partitioning (non-CDB only)'"
+  log "  Options to disable: olap, rat (partitioning skipped: this is a CDB)"
+else
+  CHOPT_PART="echo 'Disabling Partitioning...'; ./chopt disable partitioning"
+  log "  Options to disable: olap, rat (Real Application Testing), partitioning"
+fi
 
 su - "${ORACLE_USER}" -c "unset LD_LIBRARY_PATH
   export ORACLE_HOME=${NEW_DB_HOME}
@@ -156,8 +184,7 @@ su - "${ORACLE_USER}" -c "unset LD_LIBRARY_PATH
   echo 'Disabling Real Application Testing (rat)...'
   ./chopt disable rat
 
-  echo 'Disabling Partitioning...'
-  ./chopt disable partitioning
+  ${CHOPT_PART}
 "
 log "chopt disable complete."
 
@@ -171,13 +198,34 @@ su - "${ORACLE_USER}" -c "unset LD_LIBRARY_PATH
 "
 log "Database restarted."
 
-# ── Step D: Recompile invalid objects with utlrp ─────────────────────────────
-# NOTE: SYS.XOQ_VALIDATE and SYS.APS_VALIDATE are NOT called here.
-# These procedures update the database registry for the Oracle OLAP option
-# and are ONLY required when enabling or disabling OLAP using the chopt tool
-# (which is done in Step B above). They are NOT part of standard OOP patching.
-# If chopt is not used in this environment, XOQ_VALIDATE/APS_VALIDATE are
-# never needed.
+# ── Step D: OLAP registry validation (all containers) and utlrp ──────────────
+# After "chopt disable olap" the OLAP components (APS, XOQ) must be re-validated so
+# DBA_REGISTRY shows OPTION OFF. In a CDB this has to happen in CDB$ROOT, PDB$SEED
+# and every PDB; if only the root is validated, the PDBs keep showing VALID and the
+# next AutoUpgrade run fails with "Database option APS/XOQ mismatch" violations.
+log "Step D: Validating OLAP components (XOQ_VALIDATE, APS_VALIDATE)..."
+if [[ "${IS_CDB}" == "YES" ]]; then
+  printf 'exec sys.xoq_validate\nexec sys.aps_validate\n' > /tmp/phase4_olap_catcon.sql
+  chmod 644 /tmp/phase4_olap_catcon.sql
+  OLAP_LOGDIR=$(mktemp -d /tmp/phase4_olap_logs_XXXXXX); chmod 777 "${OLAP_LOGDIR}"
+  log "  CDB: running in CDB\$ROOT, PDB\$SEED and all open PDBs with catcon.pl (logs: ${OLAP_LOGDIR})"
+  runoracle_p4 "
+    export ORACLE_HOME=${NEW_DB_HOME}
+    export ORACLE_SID=${DB_INSTANCE}
+    export PATH=\${ORACLE_HOME}/bin:\${PATH}
+    \${ORACLE_HOME}/perl/bin/perl \${ORACLE_HOME}/rdbms/admin/catcon.pl -d /tmp -l ${OLAP_LOGDIR} -b phase4_olap phase4_olap_catcon.sql
+  " || log "  WARNING: catcon.pl returned non-zero. Review ${OLAP_LOGDIR} and run XOQ_VALIDATE / APS_VALIDATE in each container by hand."
+  log "  Closed PDBs are skipped by catcon: open them and re-run if any PDB is not READ WRITE."
+else
+  cat > /tmp/phase4_olap_validate.sql << 'SQLEOF'
+SET SERVEROUTPUT ON
+EXEC SYS.XOQ_VALIDATE
+EXEC SYS.APS_VALIDATE
+EXIT;
+SQLEOF
+  runsql "${DB_INSTANCE}" "${NEW_DB_HOME}" /tmp/phase4_olap_validate.sql
+fi
+
 log "Step D: Recompiling invalid objects with utlrp..."
 cat > /tmp/phase4_validate.sql << 'SQLEOF'
 SET ECHO OFF FEEDBACK ON SERVEROUTPUT ON
@@ -207,6 +255,9 @@ PROMPT === DBA_REGISTRY — APS and XOQ (must show OPTION OFF) ===
 SELECT comp_id, comp_name, status
 FROM   dba_registry
 WHERE  comp_id IN ('APS','XOQ');
+
+PROMPT === Pending plug-in violations (CDB only; expected: no rows) ===
+SELECT name, message FROM pdb_plug_in_violations WHERE status <> 'RESOLVED' AND message LIKE 'Database option%';
 
 PROMPT === datapatch status (must show SUCCESS) ===
 SELECT patch_id, status, description
